@@ -13,6 +13,7 @@ use companyd::{
     identity::load_or_create_secret,
     passkey::{AdminApproval, authenticate_interactive, collect_assertion, register_interactive},
     service,
+    store::Store,
 };
 use console::{Style, Term, style};
 use dialoguer::{Select, theme::ColorfulTheme};
@@ -46,6 +47,15 @@ enum Commands {
         node_name: String,
         #[arg(long)]
         agent_id: String,
+        /// Stable local workload name; defaults to the agent ID when SPIFFE fields are set.
+        #[arg(long)]
+        workload_id: Option<String>,
+        /// Expected SPIFFE ID for a future SPIRE Workload API binding.
+        #[arg(long, requires = "spire_socket_path")]
+        spiffe_id: Option<String>,
+        /// Future SPIRE Workload API socket URI, for example unix:///run/spire/agent.sock.
+        #[arg(long, requires = "spiffe_id")]
+        spire_socket_path: Option<String>,
         #[arg(long, value_enum)]
         permissions: Option<PermissionProfile>,
         #[arg(long, default_value_t = false)]
@@ -102,6 +112,10 @@ enum Commands {
     Delegation {
         #[command(subcommand)]
         command: DelegationCommand,
+    },
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
     },
     Loop {
         #[arg(long)]
@@ -192,6 +206,16 @@ enum DelegationCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum KnowledgeCommand {
+    /// Export memory records as JSON after removing secret-like values.
+    Export {
+        /// Owner-only output file. Omit to write JSON to standard output.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -204,6 +228,9 @@ async fn main() -> Result<()> {
             organization,
             node_name,
             agent_id,
+            workload_id,
+            spiffe_id,
+            spire_socket_path,
             permissions,
             notifications,
             automatic_loop,
@@ -245,7 +272,7 @@ async fn main() -> Result<()> {
                     register_interactive(&passkey_path, &agent_id).await?;
                 }
             }
-            let config = NodeConfig::new(
+            let mut config = NodeConfig::new(
                 organization,
                 node_name,
                 agent_id,
@@ -255,6 +282,11 @@ async fn main() -> Result<()> {
                 max_loop_iterations,
             )?
             .with_session_minutes(session_minutes)?;
+            if workload_id.is_some() || spiffe_id.is_some() || spire_socket_path.is_some() {
+                let workload_id = workload_id.unwrap_or_else(|| config.agent_id.clone());
+                config =
+                    config.with_workload_identity(workload_id, spiffe_id, spire_socket_path)?;
+            }
             config.save(&data_dir.join("config.json"))?;
             let identity = load_or_create_secret(&data_dir.join("identity.key"))?;
             permission_summary(
@@ -425,6 +457,30 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
         },
+        Commands::Knowledge { command } => match command {
+            KnowledgeCommand::Export { output } => {
+                let identity_path = data_dir.join("identity.key");
+                let database_path = data_dir.join("state.db");
+                let config_path = data_dir.join("config.json");
+                if !identity_path.exists() || !database_path.exists() {
+                    bail!("knowledge export requires an existing configured knowledge base");
+                }
+                if output.as_ref().is_some_and(|path| {
+                    path == &identity_path || path == &database_path || path == &config_path
+                }) {
+                    bail!("refusing to overwrite Company Mesh state with an export");
+                }
+                let secret = load_or_create_secret(&identity_path)?;
+                let store = Store::open(&database_path, secret)?;
+                let bytes = serde_json::to_vec_pretty(&store.export_knowledge_redacted()?)?;
+                if let Some(path) = output {
+                    write_owner_file(&path, &bytes)?;
+                    println!("Exported redacted knowledge to {}.", path.display());
+                } else {
+                    println!("{}", String::from_utf8(bytes)?);
+                }
+            }
+        },
         Commands::Loop {
             handler,
             handler_args,
@@ -520,6 +576,12 @@ fn permission_summary(config: &NodeConfig, endpoint: &str, data_dir: &Path, pass
     eprintln!("{}", style("Setup complete").color256(118).bold());
     eprintln!("  Profile       {:?}", config.permission_profile);
     eprintln!("  Agent         {}", config.agent_id);
+    if let Some(workload) = &config.workload_identity {
+        eprintln!("  Workload      {}", workload.workload_id);
+        if let Some(spiffe_id) = &workload.spiffe_id {
+            eprintln!("  SPIFFE ID     {spiffe_id}");
+        }
+    }
     eprintln!("  Endpoint      {endpoint}");
     eprintln!("  Data          {}", data_dir.display());
     eprintln!("  Notifications {}", on_off(config.notifications));
@@ -874,4 +936,34 @@ fn rotate_key(data_dir: &Path, confirm: bool) -> Result<()> {
     println!("Old identity and state moved to {}", archive.display());
     println!("All peers must enroll again.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knowledge_export_command_accepts_stdout_or_owner_file() {
+        let stdout = Cli::try_parse_from(["company-mesh", "knowledge", "export"]).unwrap();
+        assert!(matches!(
+            stdout.command,
+            Commands::Knowledge {
+                command: KnowledgeCommand::Export { output: None }
+            }
+        ));
+        let file = Cli::try_parse_from([
+            "company-mesh",
+            "knowledge",
+            "export",
+            "--output",
+            "/tmp/knowledge.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            file.command,
+            Commands::Knowledge {
+                command: KnowledgeCommand::Export { output: Some(_) }
+            }
+        ));
+    }
 }

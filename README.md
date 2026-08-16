@@ -60,6 +60,9 @@ company-mesh setup \
   --organization acme \
   --node-name alice-mac \
   --agent-id agent:alice \
+  --workload-id worker:alice \
+  --spiffe-id spiffe://acme.example/company-mesh/alice \
+  --spire-socket-path unix:///run/spire/sockets/agent.sock \
   --permissions collaborator \
   --session-minutes 30 \
   --notifications \
@@ -78,6 +81,10 @@ Permission profiles:
 
 The adapter hides tools outside the selected profile. The daemon checks the same profile
 again. Changing an existing setup requires the administrator passkey.
+
+The workload fields reserve a stable identity binding for a future SPIRE Workload API
+adapter. They are metadata today, appear in `company_identity`, and are not accepted as
+authentication evidence. Omit all three flags when SPIRE is not being planned.
 
 ## Touch ID and timed sessions
 
@@ -253,6 +260,35 @@ company-mesh key rotate --confirm
 The command requires a passkey. It moves the old identity and SQLite files into a dated
 archive. It creates a new endpoint identity and clean state. All peers must enroll again.
 
+## Export the knowledge base
+
+Export the persistent SQLite memory records to standard output or an owner-only JSON file:
+
+```sh
+company-mesh knowledge export
+company-mesh knowledge export --output /private/path/company-knowledge.json
+```
+
+The `company-mesh-knowledge-export/v1` document includes memory records and provenance.
+It excludes operational tables (including invitations, capability tokens, service grants,
+nonces, peer addresses, and delivery receipts) and replaces common secret assignments and
+Bearer values with `[REDACTED]`. This is defense in depth; credentials must never be put in
+company memory in the first place.
+
+## Optional operations adapters
+
+The Rust library exposes local adapter boundaries without connecting to hosted services:
+
+- `DurableDeliveryAdapter` consumes records from the SQLite `delivery_outbox`. Each record
+  carries a portable subject and idempotency key; acknowledgements and retry attempts remain
+  durable. This maps directly to a NATS JetStream publish with a message de-duplication ID.
+- `AuditWitnessAdapter` receives a signed audit-chain checkpoint and returns a receipt that
+  is stored in SQLite. The checkpoint and receipt fields cover the Rekor entry UUID, log
+  index, integrated time, and inclusion proof needed by a future adapter.
+
+Adapters must keep credentials outside messages, logs, and SQLite. See
+[OPERATIONS_ADAPTERS.md](docs/OPERATIONS_ADAPTERS.md) for contracts and failure semantics.
+
 ## MCP tools
 
 Read tools are available to all profiles:
@@ -303,11 +339,11 @@ GitHub tag builds create checksums, keyless Sigstore signatures, and build prove
 ## Current limits
 
 - SQLite remains the canonical memory store. Graphiti is a planned temporal projection.
-- A local node has one configured agent identity. Strong multi-workload identity is not done.
+- Workload/SPIFFE fields are metadata only. Strong multi-workload authentication is not done.
 - Reviews from two agent names in development mode are test-only. Production needs distinct
   authenticated workloads or separate enrolled nodes.
-- Audit signatures detect modification. Remote audit witnesses are still required to detect
-  deletion of the full data directory.
+- Audit signatures detect modification and the witness boundary persists external receipts,
+  but no Rekor adapter is bundled; deletion detection still requires an independent witness.
 - There is no credential broker, malware scanner, file transfer layer, or remote HTTPS MCP.
 - The bounded handler is an execution boundary. Review and sandbox every handler before use.
 

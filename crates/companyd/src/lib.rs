@@ -5,6 +5,7 @@ pub mod invite;
 pub mod model;
 pub mod network;
 pub mod notify;
+pub mod operations;
 pub mod passkey;
 pub mod rpc;
 pub mod service;

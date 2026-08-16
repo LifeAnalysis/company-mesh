@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         "endpoint_addr": endpoint.addr(),
         "socket": socket,
         "protocol": model::PROTOCOL,
+        "workload_identity": config.workload_identity,
     });
     println!("{}", serde_json::to_string(&identity)?);
     info!(endpoint_id=%endpoint.id(), socket=%socket.display(), "companyd ready");

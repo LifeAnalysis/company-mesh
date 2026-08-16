@@ -42,6 +42,13 @@ Still planned:
 - Graphiti projection and full memory lifecycle controls.
 - Remote audit witnesses, workload identity, secret brokering, and incident drills.
 
+Local foundations now present for the remaining work:
+
+- SPIFFE/SPIRE-ready workload identity metadata, without treating configuration as proof.
+- SQLite outbox and typed durable-delivery adapter boundary suitable for NATS JetStream.
+- Signed chain checkpoints and durable witness receipts suitable for a Rekor adapter.
+- Redacted JSON export of the canonical SQLite memory knowledge base.
+
 ## Delivery order
 
 1. Implement durable identity, event storage, task state, and memory records.

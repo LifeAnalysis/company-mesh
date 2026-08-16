@@ -300,6 +300,7 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
             "protocol": crate::model::PROTOCOL,
             "organization": state.config.organization,
             "agent_id": state.config.agent_id,
+            "workload_identity": state.config.workload_identity,
             "permission_profile": state.config.permission_profile,
             "enabled_actions": state.config.enabled_actions,
         })),
