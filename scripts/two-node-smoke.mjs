@@ -48,8 +48,8 @@ try {
   }
   if (!inviteReplayRejected) throw new Error('A used invite was accepted again.');
 
-  const identityA = await call(a.client, 'company_identity', {});
-  const identityB = await call(b.client, 'company_identity', {});
+  const identityA = await call(a.client, 'mesh_get_identity', {});
+  const identityB = await call(b.client, 'mesh_get_identity', {});
 
   const operationsPath = join(dataA, 'test-service-operations.json');
   await writeFile(operationsPath, JSON.stringify({ inspect: ['delegated-project', '{project}'] }), { mode: 0o600 });
@@ -57,7 +57,7 @@ try {
     '--data-dir', dataA, 'delegation', 'register-service', '--name', 'test-cli',
     '--executable', '/bin/echo', '--operations-json', operationsPath,
   ]);
-  const delegation = await call(b.client, 'company_delegation_request', {
+  const delegation = await call(b.client, 'mesh_request_service_access', {
     endpoint_addr: identityA.endpoint_addr, service: 'test-cli', project: 'company-mesh',
     operations: ['inspect'], reason: 'Verify project-scoped delegated execution.',
   });
@@ -65,22 +65,22 @@ try {
     '--data-dir', dataA, 'delegation', 'approve', '--request-id', delegation.request_id,
     '--operation', 'inspect', '--expires-minutes', '5', '--max-calls', '1',
   ]);
-  const grantsResponse = await call(b.client, 'company_service_grants', {});
-  const grants = grantsResponse.result ?? grantsResponse;
+  const grantsResponse = await call(b.client, 'mesh_list_service_grants', {});
+  const grants = grantsResponse.result ?? grantsResponse.items ?? grantsResponse;
   const grant = grants.find(item => item.service === 'test-cli' && item.project === 'company-mesh');
   if (!grant) throw new Error('Delegated service grant was not stored by node B.');
-  const delegatedResult = await call(b.client, 'company_service_call', {
+  const delegatedResult = await call(b.client, 'mesh_call_service', {
     grant_id: grant.grant_id, operation: 'inspect',
   });
   if (!delegatedResult.success || !delegatedResult.stdout.includes('delegated-project company-mesh')) {
-    throw new Error('Delegated project-scoped service execution failed.');
+    throw new Error(`Delegated project-scoped service execution failed: ${JSON.stringify(delegatedResult)}`);
   }
   const exhausted = await b.client.callTool({
-    name: 'company_service_call', arguments: { grant_id: grant.grant_id, operation: 'inspect' },
+    name: 'mesh_call_service', arguments: { grant_id: grant.grant_id, operation: 'inspect' },
   });
   if (!exhausted.isError) throw new Error('Exhausted delegated grant was accepted.');
 
-  const revocationRequest = await call(b.client, 'company_delegation_request', {
+  const revocationRequest = await call(b.client, 'mesh_request_service_access', {
     endpoint_addr: identityA.endpoint_addr, service: 'test-cli', project: 'company-mesh',
     operations: ['inspect'], reason: 'Verify immediate grant revocation.',
   });
@@ -93,16 +93,16 @@ try {
     '--data-dir', dataA, 'delegation', 'revoke', '--grant-id', revocableGrant.grant_id,
   ]);
   const revoked = await b.client.callTool({
-    name: 'company_service_call', arguments: { grant_id: revocableGrant.grant_id, operation: 'inspect' },
+    name: 'mesh_call_service', arguments: { grant_id: revocableGrant.grant_id, operation: 'inspect' },
   });
   if (!revoked.isError) throw new Error('Revoked delegated grant was accepted.');
-  await call(a.client, 'company_peer_send', {
+  await call(a.client, 'mesh_send_peer_message', {
     endpoint_addr: identityB.endpoint_addr,
     scope: 'project:company-mesh',
     message: 'Authenticated hello from node A to node B.',
   });
-  const inbox = await call(b.client, 'company_inbox', { limit: 10 });
-  const messages = inbox.result ?? inbox;
+  const inbox = await call(b.client, 'mesh_list_inbox', { limit: 10 });
+  const messages = inbox.result ?? inbox.items ?? inbox;
   if (!Array.isArray(messages) || !messages.some(item => item.payload?.text?.includes('Authenticated hello'))) {
     throw new Error('Node B did not receive the authenticated Iroh message.');
   }
@@ -111,7 +111,7 @@ try {
     '--data-dir', dataA, 'peers', 'block', identityB.endpoint_id,
   ]);
   const blockedSend = await b.client.callTool({
-    name: 'company_peer_send',
+    name: 'mesh_send_peer_message',
     arguments: {
       endpoint_addr: identityA.endpoint_addr,
       scope: 'project:company-mesh',
@@ -122,7 +122,7 @@ try {
   await execFile('target/debug/company-mesh', [
     '--data-dir', dataA, 'peers', 'unblock', identityB.endpoint_id,
   ]);
-  await call(b.client, 'company_peer_send', {
+  await call(b.client, 'mesh_send_peer_message', {
     endpoint_addr: identityA.endpoint_addr,
     scope: 'project:company-mesh',
     message: 'Message after explicit unblock.',
@@ -131,32 +131,32 @@ try {
   const suffix = Date.now().toString(36);
   const first = `T-${suffix}-1`;
   const second = `T-${suffix}-2`;
-  await call(a.client, 'company_task_create', {
+  await call(a.client, 'mesh_create_task', {
     task_id: first, title: 'Build the transport', project: 'company-mesh', depends_on: [], parallel_safe: false,
   });
-  await call(a.client, 'company_task_create', {
+  await call(a.client, 'mesh_create_task', {
     task_id: second, title: 'Use the transport', project: 'company-mesh', depends_on: [first], parallel_safe: true,
   });
-  const initiallyReady = await call(a.client, 'company_tasks_ready', { project: 'company-mesh' });
-  const firstReady = initiallyReady.result ?? initiallyReady;
+  const initiallyReady = await call(a.client, 'mesh_list_ready_tasks', { project: 'company-mesh' });
+  const firstReady = initiallyReady.result ?? initiallyReady.items ?? initiallyReady;
   if (!Array.isArray(firstReady) || !firstReady.some(task => task.task_id === first) || firstReady.some(task => task.task_id === second)) {
     throw new Error('Task dependency gate failed before task completion.');
   }
-  await call(a.client, 'company_task_claim', { task_id: first });
+  await call(a.client, 'mesh_claim_task', { task_id: first });
 
   const selfReview = await a.client.callTool({
-    name: 'company_review_record', arguments: { task_id: first, approved: true, artifact: 'review:self' },
+    name: 'mesh_record_review', arguments: { task_id: first, approved: true, artifact: 'review:self' },
   });
   if (!selfReview.isError) throw new Error('Self-review was accepted.');
 
-  const review = await call(reviewer.client, 'company_review_record', {
+  const review = await call(reviewer.client, 'mesh_record_review', {
     task_id: first, approved: true, artifact: 'review:independent',
   });
-  await call(a.client, 'company_task_submit', {
+  await call(a.client, 'mesh_submit_task', {
     task_id: first, tests_passed: true, review_id: review.review_id, commit: 'abc123',
   });
-  const finallyReady = await call(a.client, 'company_tasks_ready', { project: 'company-mesh' });
-  const secondReady = finallyReady.result ?? finallyReady;
+  const finallyReady = await call(a.client, 'mesh_list_ready_tasks', { project: 'company-mesh' });
+  const secondReady = finallyReady.result ?? finallyReady.items ?? finallyReady;
   if (!Array.isArray(secondReady) || !secondReady.some(task => task.task_id === second)) {
     throw new Error('Dependent task did not become ready.');
   }

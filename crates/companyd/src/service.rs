@@ -151,13 +151,16 @@ fn write_owner_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::{fs::OpenOptions, io::Write};
     #[cfg(unix)]
     let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file
     };
     #[cfg(not(unix))]
     let mut file = OpenOptions::new()
@@ -180,5 +183,18 @@ mod tests {
         assert!(launchd.contains("a&amp;b"));
         let systemd = render_systemd(Path::new("/tmp/a b"), Path::new("/bin/companyd"));
         assert!(systemd.contains("ReadWritePaths=\"/tmp/a b\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_file_refuses_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert!(write_owner_file(&link, b"service").is_err());
+        assert!(!target.exists());
     }
 }

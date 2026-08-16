@@ -764,7 +764,23 @@ impl Store {
         }) {
             bail!("operation arguments may contain only the exact {{project}} placeholder");
         }
+        if definition.read_only_paths.iter().any(|path| {
+            !std::path::Path::new(path).is_absolute() || !std::path::Path::new(path).exists()
+        }) {
+            bail!("delegated service read-only paths must be existing absolute paths");
+        }
         let mut stored = definition.clone();
+        stored.executable = std::fs::canonicalize(&stored.executable)?
+            .to_string_lossy()
+            .into_owned();
+        stored.read_only_paths = stored
+            .read_only_paths
+            .iter()
+            .map(std::fs::canonicalize)
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
         stored.executable_hash = blake3::hash(&std::fs::read(&stored.executable)?)
             .to_hex()
             .to_string();
@@ -772,18 +788,7 @@ impl Store {
             stored.cedar_policy =
                 generated_service_policy(&stored.name, stored.operations.keys().cloned());
         }
-        // Parsing and one known-allow evaluation make invalid policy a registration error.
-        let first_operation = stored
-            .operations
-            .keys()
-            .next()
-            .context("service has no operations")?;
-        authorize_with_cedar(
-            &stored.cedar_policy,
-            "registration-check",
-            &stored.name,
-            first_operation,
-        )?;
+        crate::delegation::validate_cedar_policy(&stored.cedar_policy)?;
         self.conn.execute(
             "INSERT INTO delegated_services(name,definition,updated_at) VALUES(?1,?2,?3)
              ON CONFLICT(name) DO UPDATE SET definition=excluded.definition,updated_at=excluded.updated_at",

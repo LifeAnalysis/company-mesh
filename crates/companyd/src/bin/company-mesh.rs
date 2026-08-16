@@ -189,6 +189,10 @@ enum DelegationCommand {
         timeout_seconds: u64,
         #[arg(long, default_value_t = 65_536)]
         max_output_bytes: usize,
+        #[arg(long)]
+        allow_network: bool,
+        #[arg(long = "read-only-path")]
+        read_only_paths: Vec<PathBuf>,
     },
     Approve {
         #[arg(long)]
@@ -420,6 +424,8 @@ async fn main() -> Result<()> {
                 operations_json,
                 timeout_seconds,
                 max_output_bytes,
+                allow_network,
+                read_only_paths,
             } => {
                 let operations: std::collections::BTreeMap<String, Vec<String>> =
                     serde_json::from_slice(&std::fs::read(&operations_json)?)?;
@@ -427,7 +433,8 @@ async fn main() -> Result<()> {
                     &data_dir,
                     "services.register",
                     json!({"name":name,"executable":executable,"operations":operations,
-                        "timeout_seconds":timeout_seconds,"max_output_bytes":max_output_bytes}),
+                        "timeout_seconds":timeout_seconds,"max_output_bytes":max_output_bytes,
+                        "allow_network":allow_network,"read_only_paths":read_only_paths}),
                 )
                 .await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -474,6 +481,16 @@ async fn main() -> Result<()> {
                 let store = Store::open(&database_path, secret)?;
                 let bytes = serde_json::to_vec_pretty(&store.export_knowledge_redacted()?)?;
                 if let Some(path) = output {
+                    let data_root = std::fs::canonicalize(&data_dir)?;
+                    let output_parent = std::fs::canonicalize(
+                        path.parent()
+                            .context("knowledge export path has no parent")?,
+                    )?;
+                    if output_parent.starts_with(&data_root) {
+                        bail!(
+                            "refusing to write a knowledge export inside the node data directory"
+                        );
+                    }
                     write_owner_file(&path, &bytes)?;
                     println!("Exported redacted knowledge to {}.", path.display());
                 } else {
@@ -573,8 +590,15 @@ fn step(name: &str, detail: &str) {
 
 fn permission_summary(config: &NodeConfig, endpoint: &str, data_dir: &Path, passkey_enabled: bool) {
     eprintln!();
-    eprintln!("{}", style("Setup complete").color256(118).bold());
-    eprintln!("  Profile       {:?}", config.permission_profile);
+    eprintln!(
+        "{} {}",
+        style("✓").color256(118).bold(),
+        style("Node configured").bold()
+    );
+    eprintln!(
+        "  Profile       {}",
+        profile_name(config.permission_profile)
+    );
     eprintln!("  Agent         {}", config.agent_id);
     if let Some(workload) = &config.workload_identity {
         eprintln!("  Workload      {}", workload.workload_id);
@@ -589,11 +613,38 @@ fn permission_summary(config: &NodeConfig, endpoint: &str, data_dir: &Path, pass
     eprintln!("  Session       {} minutes", config.session_minutes);
     eprintln!("  Passkey gate  {}", on_off(passkey_enabled));
     eprintln!();
-    eprintln!("{}", style("Allowed actions").bold());
-    for action in &config.enabled_actions {
-        eprintln!("  {} {action}", style("✓").color256(118));
-    }
+    eprintln!("{}", style("Access").bold());
+    eprintln!("  {}", profile_summary(config.permission_profile));
+    eprintln!(
+        "  {} policy-checked actions enabled",
+        config.enabled_actions.len()
+    );
     eprintln!();
+    eprintln!("{}", style("Next").bold());
+    eprintln!("  1. Start the daemon or install the user service.");
+    eprintln!("  2. Run `company-mesh session unlock` before agent writes.");
+    eprintln!("  3. Run `company-mesh status` to check the node.");
+    eprintln!();
+}
+
+fn profile_name(profile: PermissionProfile) -> &'static str {
+    match profile {
+        PermissionProfile::Observer => "Observer",
+        PermissionProfile::Collaborator => "Collaborator",
+        PermissionProfile::Operator => "Operator",
+    }
+}
+
+fn profile_summary(profile: PermissionProfile) -> &'static str {
+    match profile {
+        PermissionProfile::Observer => "Read identity, tasks, memory, peers, inbox, and audit.",
+        PermissionProfile::Collaborator => {
+            "Read and collaborate on tasks, reviews, memory, and messages."
+        }
+        PermissionProfile::Operator => {
+            "Collaborate and administer enrollment, peers, and services."
+        }
+    }
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -738,15 +789,26 @@ fn validate_adapter(adapter: &Path) -> Result<()> {
 
 fn write_owner_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::{fs::OpenOptions, io::Write};
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        bail!(
+            "refusing to write through a symbolic link: {}",
+            path.display()
+        );
+    }
     #[cfg(unix)]
     let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file
     };
     #[cfg(not(unix))]
     let mut file = OpenOptions::new()
@@ -965,5 +1027,18 @@ mod tests {
                 command: KnowledgeCommand::Export { output: Some(_) }
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_file_refuses_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert!(write_owner_file(&link, b"safe output").is_err());
+        assert!(!target.exists());
     }
 }

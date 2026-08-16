@@ -23,6 +23,10 @@ pub struct ServiceDefinition {
     pub timeout_seconds: u64,
     pub max_output_bytes: usize,
     #[serde(default)]
+    pub allow_network: bool,
+    #[serde(default)]
+    pub read_only_paths: Vec<String>,
+    #[serde(default)]
     pub cedar_policy: String,
 }
 
@@ -214,6 +218,12 @@ pub fn authorize_with_cedar(
         bail!("Cedar policy denied delegated service call");
     }
     Ok(())
+}
+
+pub fn validate_cedar_policy(policy: &str) -> Result<()> {
+    PolicySet::from_str(policy)
+        .context("parse delegated service Cedar policy")
+        .map(|_| ())
 }
 
 fn entity_uid(kind: &str, id: &str) -> Result<EntityUid> {

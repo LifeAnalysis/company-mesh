@@ -132,7 +132,7 @@ mod tests {
             organization: "acme".to_owned(),
             issuer_endpoint: secret.public().to_string(),
             issuer_addr: EndpointAddr::new(secret.public()),
-            issuer_label: "alice".to_owned(),
+            issuer_label: "node-a".to_owned(),
             invitee_label: "friend".to_owned(),
             issued_at: now,
             expires_at: now + chrono::Duration::hours(1),

@@ -18,6 +18,7 @@ dialoguer = "0.12"
 dirs = "6"
 hex = "0.4"
 iroh = "1.0.3"
+libc = "0.2"
 rusqlite = { version = "0.38", features = ["bundled"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }

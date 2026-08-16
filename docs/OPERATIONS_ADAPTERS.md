@@ -44,4 +44,4 @@ appear in checkpoint or receipt data.
 `company-mesh-knowledge-export/v1`. Operational and credential-bearing tables are excluded.
 Secret-like assignments and Bearer values are redacted in memory content and provenance
 URIs. Output files are created with owner-only permissions on Unix. The exporter refuses to
-replace the node identity, database, or configuration file.
+write inside the node data directory or through a symbolic link.

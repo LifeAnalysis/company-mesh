@@ -190,19 +190,39 @@ fn macos_command(
     arguments: &[String],
     lease: &mut CredentialLease,
 ) -> Result<Command, SandboxError> {
+    let mut extra_reads = String::new();
+    for path in &definition.read_only_paths {
+        let filter = if Path::new(path).is_dir() {
+            "subpath"
+        } else {
+            "literal"
+        };
+        extra_reads.push_str(&format!(
+            "(allow file-read* ({filter} {}))\n",
+            scheme_string(path)
+        ));
+    }
+    let network_rule = if definition.allow_network {
+        "(allow network*)"
+    } else {
+        "(deny network*)"
+    };
     let profile = format!(
         r#"(version 1)
 (deny default)
 (allow process*)
 (allow sysctl-read)
 (allow mach-lookup)
-(allow file-read* (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple") (subpath "/dev") (literal {} ) (subpath {}))
+(allow file-read* (literal "/") (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple") (subpath "/dev") (literal {} ) (subpath {}))
+{}
 (allow file-write* (subpath {}))
-(deny network*)
+{}
 "#,
         scheme_string(&definition.executable),
         scheme_string(&lease.path().to_string_lossy()),
+        extra_reads,
         scheme_string(&lease.path().to_string_lossy()),
+        network_rule,
     );
     let profile_path = lease.write(
         "COMPANY_MESH_SANDBOX_PROFILE",
@@ -226,11 +246,19 @@ fn linux_command(
     lease: &CredentialLease,
 ) -> Command {
     let mut command = Command::new("bwrap");
+    command.args(["--die-with-parent", "--new-session", "--clearenv"]);
+    if definition.allow_network {
+        command.args([
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-cgroup",
+        ]);
+    } else {
+        command.arg("--unshare-all");
+    }
     command.args([
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-all",
-        "--clearenv",
         "--ro-bind",
         "/usr",
         "/usr",
@@ -260,6 +288,9 @@ fn linux_command(
             .arg("--ro-bind")
             .arg(&definition.executable)
             .arg(&definition.executable);
+    }
+    for path in &definition.read_only_paths {
+        command.arg("--ro-bind").arg(path).arg(path);
     }
     command
         .arg("--")
@@ -316,6 +347,8 @@ mod tests {
             )]),
             timeout_seconds: 1,
             max_output_bytes: 1024,
+            allow_network: false,
+            read_only_paths: Vec::new(),
             cedar_policy: String::new(),
         }
     }
@@ -370,5 +403,75 @@ mod tests {
             std::fs::read_to_string(prepared._credentials.path().join("sandbox.sb")).unwrap();
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn macos_sandbox_can_opt_in_to_network_and_read_paths() {
+        let mut service = definition();
+        service.allow_network = true;
+        service.read_only_paths = vec!["/usr/share".to_owned(), "/usr/bin/printf".to_owned()];
+        let prepared = prepare_command_with_backend(
+            &service,
+            "inspect",
+            "mesh",
+            &NoCredentialProvider,
+            SandboxBackend::MacOs,
+        )
+        .unwrap();
+        let profile =
+            std::fs::read_to_string(prepared._credentials.path().join("sandbox.sb")).unwrap();
+        assert!(profile.contains("(allow network*)"));
+        assert!(!profile.contains("(deny network*)"));
+        assert!(profile.contains("(subpath \"/usr/share\")"));
+        assert!(profile.contains("(literal \"/usr/bin/printf\")"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_sandbox_executes_a_registered_binary() {
+        let mut prepared = prepare_command_with_backend(
+            &definition(),
+            "inspect",
+            "mesh",
+            &NoCredentialProvider,
+            SandboxBackend::MacOs,
+        )
+        .unwrap();
+        let output = prepared.command.output().await.unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("mesh"));
+    }
+
+    #[test]
+    fn linux_sandbox_keeps_network_isolated_by_default() {
+        let lease = CredentialLease::new().unwrap();
+        let command = linux_command(&definition(), &["mesh".to_owned()], &lease);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments.iter().any(|argument| argument == "--unshare-all"));
+    }
+
+    #[test]
+    fn linux_sandbox_can_keep_host_network_and_mount_read_paths() {
+        let mut service = definition();
+        service.allow_network = true;
+        service.read_only_paths = vec!["/usr/share".to_owned()];
+        let lease = CredentialLease::new().unwrap();
+        let command = linux_command(&service, &["mesh".to_owned()], &lease);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!arguments.iter().any(|argument| argument == "--unshare-all"));
+        assert!(arguments.iter().any(|argument| argument == "--unshare-pid"));
+        assert!(
+            arguments
+                .windows(3)
+                .any(|window| { window == ["--ro-bind", "/usr/share", "/usr/share"] })
+        );
     }
 }

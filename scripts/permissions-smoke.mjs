@@ -19,8 +19,8 @@ await client.connect(transport);
 try {
   const listed = await client.listTools();
   const names = listed.tools.map(tool => tool.name);
-  const forbidden = ['company_task_create', 'company_task_claim', 'company_task_submit',
-    'company_review_record', 'company_memory_propose', 'company_peer_send'];
+  const forbidden = ['mesh_create_task', 'mesh_claim_task', 'mesh_submit_task',
+    'mesh_record_review', 'mesh_propose_memory', 'mesh_send_peer_message'];
   if (forbidden.some(name => names.includes(name))) {
     throw new Error(`Observer profile exposed a write tool: ${JSON.stringify(names)}`);
   }

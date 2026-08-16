@@ -58,10 +58,10 @@ administrator passkey.
 ```sh
 company-mesh setup \
   --organization acme \
-  --node-name alice-mac \
-  --agent-id agent:alice \
-  --workload-id worker:alice \
-  --spiffe-id spiffe://acme.example/company-mesh/alice \
+  --node-name node-a \
+  --agent-id agent:node-a \
+  --workload-id worker:node-a \
+  --spiffe-id spiffe://acme.example/company-mesh/node-a \
   --spire-socket-path unix:///run/spire/sockets/agent.sock \
   --permissions collaborator \
   --session-minutes 30 \
@@ -83,7 +83,7 @@ The adapter hides tools outside the selected profile. The daemon checks the same
 again. Changing an existing setup requires the administrator passkey.
 
 The workload fields reserve a stable identity binding for a future SPIRE Workload API
-adapter. They are metadata today, appear in `company_identity`, and are not accepted as
+adapter. They are metadata today, appear in `mesh_get_identity`, and are not accepted as
 authentication evidence. Omit all three flags when SPIRE is not being planned.
 
 ## Touch ID and timed sessions
@@ -155,8 +155,8 @@ The inviter must have the `operator` profile. Invite creation requires a passkey
 
 ```sh
 company-mesh invite create \
-  --invitee-label bob-laptop \
-  --scope project:treasuryos \
+  --invitee-label node-b \
+  --scope project:example \
   --rate-per-minute 30 \
   --expires-hours 24
 ```
@@ -165,7 +165,7 @@ Save the returned token in an owner-only file. Send that file through a separate
 channel. The colleague runs:
 
 ```sh
-company-mesh join --token-file /private/path/company-mesh.invite
+company-mesh join --token-file /path/to/company-mesh.invite
 ```
 
 `company-mesh join --stdin` is also available. The positional token form can expose the
@@ -192,7 +192,7 @@ per invocation. Setup stores the lower configured limit.
 
 ```sh
 company-mesh loop \
-  --handler /absolute/path/to/reply-handler \
+  --handler /path/to/reply-handler \
   --handler-arg value \
   --max-iterations 3
 ```
@@ -218,11 +218,19 @@ The owner registers it. Registration requires a fresh Touch ID approval:
 ```sh
 company-mesh delegation register-service \
   --name vercel \
-  --executable /absolute/path/to/vercel \
-  --operations-json /private/path/vercel-operations.json
+  --executable /path/to/vercel \
+  --operations-json /path/to/vercel-operations.json \
+  --allow-network \
+  --read-only-path /path/to/required-runtime-files
 ```
 
-The requesting agent uses `company_delegation_request`. The request appears in the
+Network access is off by default. `--allow-network` permits broad outbound network
+access inside the process sandbox. It does not restrict traffic to Vercel domains. A
+Node-based CLI also needs explicit read-only access to its runtime and package files.
+Prefer a standalone executable when one is available. Do not add a path that contains
+credentials.
+
+The requesting agent uses `mesh_request_service_access`. The request appears in the
 owner's verified inbox. The owner approves a strict subset:
 
 ```sh
@@ -234,10 +242,15 @@ company-mesh delegation approve \
 ```
 
 The requesting node stores the signed grant internally. The agent sees only its grant
-ID and uses `company_service_call`. The grant token and Vercel credential never enter
-model context. The daemon checks the peer, project, operation, expiry, call count,
-registered executable digest, timeout, and output limit. It starts the executable
-directly. It does not use a shell or accept arbitrary arguments.
+ID and uses `mesh_call_service`. The grant token never enters model context. A
+credential-provider interface exists, but this release does not include a Vercel,
+Keychain, Vault, or OpenBao provider. The example can run only an operation that does not
+need a credential until one of those providers is implemented. The daemon checks the peer,
+project, operation, expiry, call count, registered executable digest, timeout, and output
+limit. It starts the executable
+directly in `sandbox-exec` on macOS or Bubblewrap on Linux. It clears the environment,
+uses a temporary working directory, and does not use a shell or accept arbitrary
+arguments.
 
 Revoke an active grant at any time:
 
@@ -266,7 +279,7 @@ Export the persistent SQLite memory records to standard output or an owner-only 
 
 ```sh
 company-mesh knowledge export
-company-mesh knowledge export --output /private/path/company-knowledge.json
+company-mesh knowledge export --output /path/to/company-knowledge.json
 ```
 
 The `company-mesh-knowledge-export/v1` document includes memory records and provenance.
@@ -293,25 +306,25 @@ Adapters must keep credentials outside messages, logs, and SQLite. See
 
 Read tools are available to all profiles:
 
-- `company_identity`
-- `company_tasks_ready`
-- `company_memory_search`
-- `company_peers`
-- `company_inbox`
-- `company_audit_tail`
-- `company_audit_verify`
+- `mesh_get_identity`
+- `mesh_list_ready_tasks`
+- `mesh_search_memory`
+- `mesh_list_peers`
+- `mesh_list_inbox`
+- `mesh_list_audit_events`
+- `mesh_verify_audit_chain`
 
 Collaborator and operator profiles also receive:
 
-- `company_task_create`
-- `company_task_claim`
-- `company_task_submit`
-- `company_review_record`
-- `company_memory_propose`
-- `company_peer_send`
-- `company_delegation_request`
-- `company_service_grants`
-- `company_service_call`
+- `mesh_create_task`
+- `mesh_claim_task`
+- `mesh_submit_task`
+- `mesh_record_review`
+- `mesh_propose_memory`
+- `mesh_send_peer_message`
+- `mesh_request_service_access`
+- `mesh_list_service_grants`
+- `mesh_call_service`
 
 No MCP tool can create invites, join networks, change permissions, block peers, revoke
 peers, rotate keys, or access passkey material.
@@ -345,6 +358,8 @@ GitHub tag builds create checksums, keyless Sigstore signatures, and build prove
 - Audit signatures detect modification and the witness boundary persists external receipts,
   but no Rekor adapter is bundled; deletion detection still requires an independent witness.
 - There is no credential broker, malware scanner, file transfer layer, or remote HTTPS MCP.
+- Delegated network access is either off or broad outbound access. Domain allowlists need
+  a separate egress proxy.
 - The bounded handler is an execution boundary. Review and sandbox every handler before use.
 
 See [PLAN.md](PLAN.md), [WORKTREE_EXECUTION_PLAN.md](docs/WORKTREE_EXECUTION_PLAN.md),

@@ -10,10 +10,12 @@ cryptographic review.
 - Rust source, unsafe patterns, local socket handling, Iroh message handling, passkey
   approval, enrollment, capabilities, service files, installer, and release workflow.
 - `cargo clippy --workspace --all-targets -- -D warnings`.
-- `cargo test --workspace`: 11 tests, including software-passkey, action binding,
-  replay rejection, capability enforcement, and two-node Iroh exchange.
-- `cargo audit`: no known vulnerable Rust crates. One unmaintained transitive crate,
-  `paste 1.0.15`, is present on non-macOS Iroh network dependency paths.
+- `cargo test --workspace`: 27 tests, including platform sandbox execution, symlink-safe
+  owner-file writes, passkey action binding, replay rejection, capability enforcement,
+  durable adapters, knowledge redaction, and two-node Iroh exchange.
+- `cargo audit`: no known vulnerable Rust crates. Two allowed maintenance warnings remain.
+  `paste 1.0.15` is present on non-macOS Iroh dependency paths. `proc-macro-error2
+  2.0.1` is a build-time dependency of `biscuit-auth` through `biscuit-quote`.
 - `npm audit`: zero known vulnerabilities across production and development packages.
 - Gitleaks source scan: no detected secret.
 - Shell syntax checks for release and install scripts.
@@ -111,9 +113,13 @@ network controls, and brokered short-lived credentials.
 Delegated services are narrower than the reply loop. The owner registers an absolute
 executable and fixed arguments with Touch ID. Grants bind the peer, project, operations,
 expiry, and call count. The executable digest, timeout, and output size are checked.
-However, the child process uses the owner's local CLI session and is not yet placed in an
-operating-system sandbox. Output can contain sensitive data. Register read-only commands
-and review their output behavior before granting them.
+The child runs in `sandbox-exec` on macOS or Bubblewrap on Linux. The daemon clears its
+environment, uses an owner-only temporary working directory, denies network by default,
+and exposes only registered read-only paths. A service can opt in to broad outbound
+network access. Domain-level egress control is not implemented; use a separate proxy for
+that boundary. A credential-provider contract and short-lived file lease exist, but no
+Keychain, Vault, or OpenBao provider is bundled. Output can contain sensitive data.
+Register read-only commands and review their output behavior before granting them.
 
 ### Prompt injection and company memory
 
@@ -159,6 +165,6 @@ Recommended production shape:
 ## Production gate
 
 Do not enable unattended work until the open invite-binding, recovery, transactional
-audit, workload identity, secret brokering, and process sandbox items are complete. The
+audit, workload identity, secret brokering, and domain egress items are complete. The
 current release is suitable for supervised peer messaging and task coordination on
 trusted hosts.
