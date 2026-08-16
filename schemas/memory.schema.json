@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://company.mesh/schemas/memory.schema.json",
+  "title": "Company Mesh memory episode",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scope", "kind", "content", "source_uri"],
+  "properties": {
+    "scope": { "type": "string", "pattern": "^(task|project|team|company):" },
+    "kind": { "enum": ["observation", "decision", "fact", "handoff", "incident"] },
+    "content": { "type": "string", "minLength": 1, "maxLength": 50000 },
+    "source_uri": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "valid_from": { "type": ["string", "null"], "format": "date-time" },
+    "supersedes": { "type": ["string", "null"], "format": "uuid" }
+  }
+}

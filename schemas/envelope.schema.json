@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://company.mesh/schemas/envelope.schema.json",
+  "title": "Company Mesh envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "message_id", "sender_endpoint", "sender_agent", "kind", "scope", "issued_at", "expires_at", "nonce", "payload", "payload_hash", "signature"],
+  "properties": {
+    "protocol": { "const": "company.mesh/1" },
+    "message_id": { "type": "string", "format": "uuid" },
+    "correlation_id": { "type": ["string", "null"], "format": "uuid" },
+    "sender_endpoint": { "type": "string", "minLength": 32 },
+    "sender_agent": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "kind": { "enum": ["message", "task_offer", "task_result", "memory_episode", "receipt", "enrollment_request"] },
+    "scope": { "type": "string", "pattern": "^(task|project|team|company):" },
+    "issued_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "nonce": { "type": "string", "minLength": 16 },
+    "capability_ref": { "type": ["string", "null"] },
+    "payload": {},
+    "payload_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "signature": { "type": "string", "minLength": 80 }
+  }
+}

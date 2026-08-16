@@ -1,0 +1,30 @@
+[package]
+name = "companyd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+console = "0.16"
+dialoguer = "0.12"
+dirs = "6"
+hex = "0.4"
+iroh = "1.0.3"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+webauthn-rs = "0.5.5"
+
+[dev-dependencies]
+tempfile = "3"
+webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }

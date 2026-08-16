@@ -1,0 +1,179 @@
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+const execFile = promisify(execFileCallback);
+const [dataA, dataB, socketA, socketB] = process.argv.slice(2);
+if (!dataA || !dataB || !socketA || !socketB) {
+  throw new Error('Usage: node scripts/two-node-smoke.mjs DATA_A DATA_B SOCKET_A SOCKET_B');
+}
+
+async function connect(socket, agent) {
+  const client = new Client({ name: `smoke-${agent}`, version: '0.1.0' });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['packages/company-mcp/dist/index.js'],
+    env: { ...process.env, COMPANY_MESH_SOCKET: socket, COMPANY_AGENT_ID: agent },
+  });
+  await client.connect(transport);
+  return { client, transport };
+}
+
+async function call(client, name, args) {
+  const result = await client.callTool({ name, arguments: args });
+  if (result.isError) throw new Error(`${name} failed: ${JSON.stringify(result.structuredContent)}`);
+  return result.structuredContent;
+}
+
+const a = await connect(socketA, 'agent:builder');
+const b = await connect(socketB, 'agent:friend');
+const reviewer = await connect(socketA, 'agent:reviewer');
+
+try {
+  const inviteResult = await execFile('target/debug/company-mesh', [
+    '--data-dir', dataA, 'invite', 'create', '--invitee-label', 'node-b',
+    '--scope', 'project:company-mesh', '--rate-per-minute', '30', '--expires-hours', '1',
+  ]);
+  const invite = inviteResult.stdout.trim();
+  if (!invite) throw new Error('Invite creation returned no token.');
+  await execFile('target/debug/company-mesh', ['--data-dir', dataB, 'join', invite]);
+  let inviteReplayRejected = false;
+  try {
+    await execFile('target/debug/company-mesh', ['--data-dir', dataB, 'join', invite]);
+  } catch {
+    inviteReplayRejected = true;
+  }
+  if (!inviteReplayRejected) throw new Error('A used invite was accepted again.');
+
+  const identityA = await call(a.client, 'company_identity', {});
+  const identityB = await call(b.client, 'company_identity', {});
+
+  const operationsPath = join(dataA, 'test-service-operations.json');
+  await writeFile(operationsPath, JSON.stringify({ inspect: ['delegated-project', '{project}'] }), { mode: 0o600 });
+  await execFile('target/debug/company-mesh', [
+    '--data-dir', dataA, 'delegation', 'register-service', '--name', 'test-cli',
+    '--executable', '/bin/echo', '--operations-json', operationsPath,
+  ]);
+  const delegation = await call(b.client, 'company_delegation_request', {
+    endpoint_addr: identityA.endpoint_addr, service: 'test-cli', project: 'company-mesh',
+    operations: ['inspect'], reason: 'Verify project-scoped delegated execution.',
+  });
+  await execFile('target/debug/company-mesh', [
+    '--data-dir', dataA, 'delegation', 'approve', '--request-id', delegation.request_id,
+    '--operation', 'inspect', '--expires-minutes', '5', '--max-calls', '1',
+  ]);
+  const grantsResponse = await call(b.client, 'company_service_grants', {});
+  const grants = grantsResponse.result ?? grantsResponse;
+  const grant = grants.find(item => item.service === 'test-cli' && item.project === 'company-mesh');
+  if (!grant) throw new Error('Delegated service grant was not stored by node B.');
+  const delegatedResult = await call(b.client, 'company_service_call', {
+    grant_id: grant.grant_id, operation: 'inspect',
+  });
+  if (!delegatedResult.success || !delegatedResult.stdout.includes('delegated-project company-mesh')) {
+    throw new Error('Delegated project-scoped service execution failed.');
+  }
+  const exhausted = await b.client.callTool({
+    name: 'company_service_call', arguments: { grant_id: grant.grant_id, operation: 'inspect' },
+  });
+  if (!exhausted.isError) throw new Error('Exhausted delegated grant was accepted.');
+
+  const revocationRequest = await call(b.client, 'company_delegation_request', {
+    endpoint_addr: identityA.endpoint_addr, service: 'test-cli', project: 'company-mesh',
+    operations: ['inspect'], reason: 'Verify immediate grant revocation.',
+  });
+  const revocationApproval = await execFile('target/debug/company-mesh', [
+    '--data-dir', dataA, 'delegation', 'approve', '--request-id', revocationRequest.request_id,
+    '--operation', 'inspect', '--expires-minutes', '5', '--max-calls', '2',
+  ]);
+  const revocableGrant = JSON.parse(revocationApproval.stdout);
+  await execFile('target/debug/company-mesh', [
+    '--data-dir', dataA, 'delegation', 'revoke', '--grant-id', revocableGrant.grant_id,
+  ]);
+  const revoked = await b.client.callTool({
+    name: 'company_service_call', arguments: { grant_id: revocableGrant.grant_id, operation: 'inspect' },
+  });
+  if (!revoked.isError) throw new Error('Revoked delegated grant was accepted.');
+  await call(a.client, 'company_peer_send', {
+    endpoint_addr: identityB.endpoint_addr,
+    scope: 'project:company-mesh',
+    message: 'Authenticated hello from node A to node B.',
+  });
+  const inbox = await call(b.client, 'company_inbox', { limit: 10 });
+  const messages = inbox.result ?? inbox;
+  if (!Array.isArray(messages) || !messages.some(item => item.payload?.text?.includes('Authenticated hello'))) {
+    throw new Error('Node B did not receive the authenticated Iroh message.');
+  }
+
+  await execFile('target/debug/company-mesh', [
+    '--data-dir', dataA, 'peers', 'block', identityB.endpoint_id,
+  ]);
+  const blockedSend = await b.client.callTool({
+    name: 'company_peer_send',
+    arguments: {
+      endpoint_addr: identityA.endpoint_addr,
+      scope: 'project:company-mesh',
+      message: 'This message must be blocked.',
+    },
+  });
+  if (!blockedSend.isError) throw new Error('A blocked peer was still able to send.');
+  await execFile('target/debug/company-mesh', [
+    '--data-dir', dataA, 'peers', 'unblock', identityB.endpoint_id,
+  ]);
+  await call(b.client, 'company_peer_send', {
+    endpoint_addr: identityA.endpoint_addr,
+    scope: 'project:company-mesh',
+    message: 'Message after explicit unblock.',
+  });
+
+  const suffix = Date.now().toString(36);
+  const first = `T-${suffix}-1`;
+  const second = `T-${suffix}-2`;
+  await call(a.client, 'company_task_create', {
+    task_id: first, title: 'Build the transport', project: 'company-mesh', depends_on: [], parallel_safe: false,
+  });
+  await call(a.client, 'company_task_create', {
+    task_id: second, title: 'Use the transport', project: 'company-mesh', depends_on: [first], parallel_safe: true,
+  });
+  const initiallyReady = await call(a.client, 'company_tasks_ready', { project: 'company-mesh' });
+  const firstReady = initiallyReady.result ?? initiallyReady;
+  if (!Array.isArray(firstReady) || !firstReady.some(task => task.task_id === first) || firstReady.some(task => task.task_id === second)) {
+    throw new Error('Task dependency gate failed before task completion.');
+  }
+  await call(a.client, 'company_task_claim', { task_id: first });
+
+  const selfReview = await a.client.callTool({
+    name: 'company_review_record', arguments: { task_id: first, approved: true, artifact: 'review:self' },
+  });
+  if (!selfReview.isError) throw new Error('Self-review was accepted.');
+
+  const review = await call(reviewer.client, 'company_review_record', {
+    task_id: first, approved: true, artifact: 'review:independent',
+  });
+  await call(a.client, 'company_task_submit', {
+    task_id: first, tests_passed: true, review_id: review.review_id, commit: 'abc123',
+  });
+  const finallyReady = await call(a.client, 'company_tasks_ready', { project: 'company-mesh' });
+  const secondReady = finallyReady.result ?? finallyReady;
+  if (!Array.isArray(secondReady) || !secondReady.some(task => task.task_id === second)) {
+    throw new Error('Dependent task did not become ready.');
+  }
+
+  console.log(JSON.stringify({
+    iroh_message: 'passed',
+    signed_invite_enrollment: 'passed',
+    single_use_invite: 'passed',
+    block_and_unblock: 'passed',
+    dependency_gate: 'passed',
+    self_review_rejected: true,
+    independent_review: 'passed',
+    delegated_project_service: 'passed',
+    delegated_grant_exhaustion: 'passed',
+    delegated_grant_revocation: 'passed',
+    next_ready_task: second,
+  }, null, 2));
+} finally {
+  await Promise.all([a.transport.close(), b.transport.close(), reviewer.transport.close()]);
+}

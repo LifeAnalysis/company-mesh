@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated dependency and build directories"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)build/''',
+  '''(^|/)dist/''',
+  '''(^|/)packages/company-mcp/dist/''',
+]

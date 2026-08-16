@@ -1,0 +1,11 @@
+/target/
+/node_modules/
+/packages/company-mcp/dist/
+/build/
+/dist/
+/.company-mesh/
+*.sock
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

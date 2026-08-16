@@ -1,0 +1,12 @@
+{
+  "name": "company-mesh",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "npm run build --workspace @company-mesh/mcp",
+    "bundle": "npm run bundle --workspace @company-mesh/mcp",
+    "typecheck": "npm run typecheck --workspace @company-mesh/mcp",
+    "test": "npm run test --workspace @company-mesh/mcp"
+  }
+}
