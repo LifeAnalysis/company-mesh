@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 biscuit-auth = "6.0.0"
 blake3 = "1"
 cedar-policy = "4.12.0"
