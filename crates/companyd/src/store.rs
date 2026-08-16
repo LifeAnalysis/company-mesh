@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use chrono::{DateTime, Utc};
 use iroh::{EndpointAddr, SecretKey, Signature};
+use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,6 +21,10 @@ use crate::{
     },
     invite::{CapabilityGrant, SignedInvite},
     model::valid_scope,
+    operations::{
+        AuditCheckpoint, AuditWitnessAdapter, DeliveryReceipt, DeliveryRecord,
+        DurableDeliveryAdapter, WitnessReceipt,
+    },
 };
 
 pub struct Store {
@@ -159,6 +165,30 @@ impl Store {
                 calls_used INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS delivery_outbox (
+                delivery_id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                receipt TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS delivery_outbox_pending_idx
+                ON delivery_outbox(status, created_at);
+            CREATE TABLE IF NOT EXISTS audit_witness_receipts (
+                endpoint_id TEXT NOT NULL,
+                chain_size INTEGER NOT NULL,
+                head_hash TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                receipt TEXT NOT NULL,
+                witnessed_at TEXT NOT NULL,
+                PRIMARY KEY(endpoint_id, chain_size, provider)
             );
             "#,
         )?;
@@ -1016,6 +1046,175 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn enqueue_delivery(
+        &self,
+        subject: &str,
+        payload: &Value,
+        idempotency_key: &str,
+    ) -> Result<DeliveryRecord> {
+        if subject.is_empty()
+            || subject.len() > 255
+            || subject.split('.').any(|part| {
+                part.is_empty()
+                    || !part.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                    })
+            })
+        {
+            bail!("delivery subject must be a dot-separated portable subject");
+        }
+        if idempotency_key.trim().is_empty() || idempotency_key.len() > 255 {
+            bail!("delivery idempotency key must contain 1 to 255 characters");
+        }
+        let delivery_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO delivery_outbox(delivery_id,subject,payload,content_type,idempotency_key,status,created_at,updated_at) VALUES(?1,?2,?3,'application/json',?4,'pending',?5,?5)",
+            params![delivery_id, subject, payload.to_string(), idempotency_key, now],
+        )?;
+        Ok(DeliveryRecord {
+            delivery_id,
+            subject: subject.to_owned(),
+            payload: payload.clone(),
+            content_type: "application/json".to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+            attempts: 0,
+            created_at: now,
+        })
+    }
+
+    pub fn pending_deliveries(&self, limit: usize) -> Result<Vec<DeliveryRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT delivery_id,subject,payload,content_type,idempotency_key,attempts,created_at
+             FROM delivery_outbox WHERE status='pending' ORDER BY created_at,delivery_id LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(1000) as i64], |row| {
+            let payload: String = row.get(2)?;
+            Ok(DeliveryRecord {
+                delivery_id: row.get(0)?,
+                subject: row.get(1)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                content_type: row.get(3)?,
+                idempotency_key: row.get(4)?,
+                attempts: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Publishes queued records in stable order and persists every broker acknowledgement.
+    /// A retryable adapter error leaves the record pending; a permanent error marks it failed.
+    pub fn deliver_pending<A: DurableDeliveryAdapter>(
+        &self,
+        adapter: &mut A,
+        limit: usize,
+    ) -> Result<Vec<DeliveryReceipt>> {
+        let mut receipts = Vec::new();
+        for record in self.pending_deliveries(limit)? {
+            match adapter.publish(&record) {
+                Ok(receipt) => {
+                    self.conn.execute(
+                        "UPDATE delivery_outbox SET status='delivered',attempts=attempts+1,last_error=NULL,receipt=?1,updated_at=?2 WHERE delivery_id=?3 AND status='pending'",
+                        params![serde_json::to_string(&receipt)?, Utc::now().to_rfc3339(), record.delivery_id],
+                    )?;
+                    receipts.push(receipt);
+                }
+                Err(error) => {
+                    let status = if error.retryable { "pending" } else { "failed" };
+                    self.conn.execute(
+                        "UPDATE delivery_outbox SET status=?1,attempts=attempts+1,last_error=?2,updated_at=?3 WHERE delivery_id=?4 AND status='pending'",
+                        params![status, error.to_string(), Utc::now().to_rfc3339(), record.delivery_id],
+                    )?;
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(receipts)
+    }
+
+    pub fn latest_audit_checkpoint(&self) -> Result<Option<AuditCheckpoint>> {
+        self.conn
+            .query_row(
+                "SELECT seq,event_id,event_hash,signature,created_at FROM events ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(AuditCheckpoint {
+                        protocol: crate::model::PROTOCOL.to_owned(),
+                        endpoint_id: self.secret.public().to_string(),
+                        chain_size: row.get(0)?,
+                        event_id: row.get(1)?,
+                        head_hash: row.get(2)?,
+                        head_signature: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Submits the latest signed chain head and durably stores the transparency-log receipt.
+    pub fn witness_latest<A: AuditWitnessAdapter>(
+        &self,
+        adapter: &mut A,
+    ) -> Result<Option<WitnessReceipt>> {
+        self.verify_audit_chain()?;
+        let Some(checkpoint) = self.latest_audit_checkpoint()? else {
+            return Ok(None);
+        };
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT receipt FROM audit_witness_receipts WHERE endpoint_id=?1 AND chain_size=?2 AND provider=?3",
+                params![checkpoint.endpoint_id, checkpoint.chain_size, adapter.provider()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            return Ok(Some(serde_json::from_str(&existing)?));
+        }
+        let receipt = adapter.witness(&checkpoint)?;
+        if receipt.provider != adapter.provider() || receipt.entry_id.trim().is_empty() {
+            bail!("audit witness returned an incomplete receipt");
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO audit_witness_receipts(endpoint_id,chain_size,head_hash,provider,receipt,witnessed_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![checkpoint.endpoint_id, checkpoint.chain_size, checkpoint.head_hash, receipt.provider, serde_json::to_string(&receipt)?, Utc::now().to_rfc3339()],
+        )?;
+        Ok(Some(receipt))
+    }
+
+    /// Exports only the memory knowledge base. Operational tables and credential-bearing
+    /// invitation/grant rows are deliberately excluded, and secret-like text is redacted.
+    pub fn export_knowledge_redacted(&self) -> Result<Value> {
+        let mut statement = self.conn.prepare(
+            "SELECT memory_id,scope,kind,content,source_uri,source_hash,status,valid_from,supersedes,created_by,created_at FROM memories ORDER BY created_at,memory_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(json!({
+                "memory_id": row.get::<_, String>(0)?, "scope": row.get::<_, String>(1)?,
+                "kind": row.get::<_, String>(2)?, "content": row.get::<_, String>(3)?,
+                "source_uri": row.get::<_, String>(4)?, "source_hash": row.get::<_, String>(5)?,
+                "status": row.get::<_, String>(6)?, "valid_from": row.get::<_, Option<String>>(7)?,
+                "supersedes": row.get::<_, Option<String>>(8)?, "created_by": row.get::<_, String>(9)?,
+                "created_at": row.get::<_, String>(10)?
+            }))
+        })?;
+        let memories = rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(redact_json)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "format": "company-mesh-knowledge-export/v1",
+            "redacted": true,
+            "exported_at": Utc::now().to_rfc3339(),
+            "memories": memories,
+        }))
+    }
+
     pub fn verify_audit_chain(&self) -> Result<()> {
         let mut statement = self.conn.prepare(
             "SELECT event_id,kind,scope,actor,payload,created_at,previous_hash,event_hash,signature FROM events ORDER BY seq ASC"
@@ -1092,9 +1291,107 @@ fn validate_identifier(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+fn redact_json(value: Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    let lowered = key.to_ascii_lowercase();
+                    if [
+                        "password",
+                        "secret",
+                        "token",
+                        "credential",
+                        "private_key",
+                        "api_key",
+                    ]
+                    .iter()
+                    .any(|candidate| {
+                        lowered == *candidate || lowered.ends_with(&format!("_{candidate}"))
+                    }) {
+                        (key, Value::String("[REDACTED]".to_owned()))
+                    } else {
+                        (key, redact_json(value))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_json).collect()),
+        Value::String(value) => Value::String(redact_text(&value)),
+        other => other,
+    }
+}
+
+fn redact_text(value: &str) -> String {
+    static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+    static BEARER: OnceLock<Regex> = OnceLock::new();
+    let assignment = ASSIGNMENT.get_or_init(|| {
+        Regex::new(r#"(?i)\b(api[_-]?key|access[_-]?token|secret|password|credential)\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"#)
+            .expect("redaction regex is valid")
+    });
+    let bearer = BEARER.get_or_init(|| {
+        Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+").expect("redaction regex is valid")
+    });
+    let value = assignment.replace_all(value, "$1=[REDACTED]");
+    bearer.replace_all(&value, "Bearer [REDACTED]").into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::{AdapterError, AuditWitnessAdapter, DurableDeliveryAdapter};
+
+    struct RecordingDelivery {
+        fail_once: bool,
+        seen: Vec<String>,
+    }
+
+    impl DurableDeliveryAdapter for RecordingDelivery {
+        fn publish(
+            &mut self,
+            message: &DeliveryRecord,
+        ) -> std::result::Result<DeliveryReceipt, AdapterError> {
+            self.seen.push(message.idempotency_key.clone());
+            if self.fail_once {
+                self.fail_once = false;
+                return Err(AdapterError {
+                    code: "nats_unavailable".into(),
+                    message: "broker unavailable".into(),
+                    retryable: true,
+                });
+            }
+            Ok(DeliveryReceipt {
+                provider: "nats-jetstream".into(),
+                sequence: Some(42),
+                acknowledged_at: Utc::now().to_rfc3339(),
+            })
+        }
+    }
+
+    struct RecordingWitness {
+        calls: usize,
+    }
+
+    impl AuditWitnessAdapter for RecordingWitness {
+        fn provider(&self) -> &str {
+            "rekor"
+        }
+
+        fn witness(
+            &mut self,
+            checkpoint: &AuditCheckpoint,
+        ) -> std::result::Result<WitnessReceipt, AdapterError> {
+            self.calls += 1;
+            Ok(WitnessReceipt {
+                provider: "rekor".into(),
+                entry_id: checkpoint.head_hash.clone(),
+                log_index: Some(7),
+                integrated_at: Utc::now().to_rfc3339(),
+                proof: json!({"inclusion_promise": "test-only"}),
+            })
+        }
+    }
 
     #[test]
     fn dependencies_and_independent_review_are_enforced() {
@@ -1248,5 +1545,84 @@ mod tests {
                 .authorize_outbound(&peer_key.public().to_string(), "message", "project:mesh")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn delivery_outbox_survives_failure_and_persists_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let key = SecretKey::generate();
+        {
+            let store = Store::open(&path, key.clone()).unwrap();
+            store
+                .enqueue_delivery(
+                    "company.mesh.events",
+                    &json!({"event": "created"}),
+                    "event-1",
+                )
+                .unwrap();
+            let mut adapter = RecordingDelivery {
+                fail_once: true,
+                seen: Vec::new(),
+            };
+            assert!(store.deliver_pending(&mut adapter, 10).is_err());
+        }
+        let store = Store::open(&path, key).unwrap();
+        assert_eq!(store.pending_deliveries(10).unwrap()[0].attempts, 1);
+        let mut adapter = RecordingDelivery {
+            fail_once: false,
+            seen: Vec::new(),
+        };
+        let receipts = store.deliver_pending(&mut adapter, 10).unwrap();
+        assert_eq!(receipts[0].sequence, Some(42));
+        assert!(store.pending_deliveries(10).unwrap().is_empty());
+        assert_eq!(adapter.seen, ["event-1"]);
+    }
+
+    #[test]
+    fn audit_checkpoint_is_witnessed_only_once_per_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db"), SecretKey::generate()).unwrap();
+        store
+            .append_event("test.event", "company:test", "tester", &json!({"ok": true}))
+            .unwrap();
+        let mut witness = RecordingWitness { calls: 0 };
+        let first = store.witness_latest(&mut witness).unwrap().unwrap();
+        let second = store.witness_latest(&mut witness).unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(witness.calls, 1);
+        store
+            .conn
+            .execute("UPDATE events SET payload='{}'", [])
+            .unwrap();
+        assert!(store.witness_latest(&mut witness).is_err());
+        assert_eq!(witness.calls, 1);
+    }
+
+    #[test]
+    fn knowledge_export_excludes_operational_tables_and_redacts_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db"), SecretKey::generate()).unwrap();
+        store
+            .propose_memory(
+                "agent",
+                MemoryProposal {
+                    scope: "project:mesh",
+                    kind: "observation",
+                    content: "password=hunter2 Authorization: Bearer abc.def",
+                    source_uri: "note:api_key=private-value",
+                    valid_from: None,
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        let export = store.export_knowledge_redacted().unwrap();
+        let text = serde_json::to_string(&export).unwrap();
+        assert_eq!(export["format"], "company-mesh-knowledge-export/v1");
+        assert!(text.contains("[REDACTED]"));
+        assert!(!text.contains("hunter2"));
+        assert!(!text.contains("abc.def"));
+        assert!(!text.contains("private-value"));
+        assert!(export.get("service_grants").is_none());
     }
 }

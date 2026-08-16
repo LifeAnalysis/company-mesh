@@ -758,6 +758,7 @@ dependencies = [
  "dirs",
  "hex",
  "iroh",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

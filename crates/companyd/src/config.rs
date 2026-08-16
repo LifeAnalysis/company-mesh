@@ -18,6 +18,78 @@ pub struct NodeConfig {
     pub session_minutes: u16,
     #[serde(default)]
     pub allow_agent_override: bool,
+    #[serde(default)]
+    pub workload_identity: Option<WorkloadIdentityConfig>,
+}
+
+/// Configuration needed to bind the configured agent to a workload identity.
+///
+/// `spiffe_id` is optional until a SPIRE Workload API client is installed. The daemon
+/// exposes these values as identity metadata; it does not yet treat them as an
+/// authenticated claim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadIdentityConfig {
+    pub workload_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spiffe_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spire_socket_path: Option<String>,
+}
+
+impl WorkloadIdentityConfig {
+    pub fn new(
+        workload_id: String,
+        spiffe_id: Option<String>,
+        spire_socket_path: Option<String>,
+    ) -> Result<Self> {
+        if workload_id.trim().is_empty() || workload_id.len() > 255 {
+            bail!("workload ID must contain 1 to 255 characters");
+        }
+        if let Some(id) = spiffe_id.as_deref() {
+            validate_spiffe_id(id)?;
+        }
+        if spire_socket_path
+            .as_deref()
+            .is_some_and(|value| !value.starts_with("unix:///") || value.len() <= "unix:///".len())
+        {
+            bail!("SPIRE socket path must be an absolute unix:/// URI");
+        }
+        Ok(Self {
+            workload_id,
+            spiffe_id,
+            spire_socket_path,
+        })
+    }
+}
+
+fn validate_spiffe_id(value: &str) -> Result<()> {
+    if value.len() > 2048 || value.contains(['?', '#', '\\']) {
+        bail!("invalid SPIFFE ID");
+    }
+    let rest = value
+        .strip_prefix("spiffe://")
+        .context("SPIFFE ID must start with spiffe://")?;
+    let (trust_domain, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if trust_domain.is_empty()
+        || trust_domain.len() > 255
+        || trust_domain.split('.').any(|label| {
+            label.is_empty()
+                || !label.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                })
+                || label.starts_with('-')
+                || label.ends_with('-')
+        })
+        || path
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        bail!("invalid SPIFFE ID");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, clap::ValueEnum)]
@@ -110,6 +182,7 @@ impl NodeConfig {
             max_loop_iterations,
             session_minutes: default_session_minutes(),
             allow_agent_override: false,
+            workload_identity: None,
         })
     }
 
@@ -118,6 +191,20 @@ impl NodeConfig {
             bail!("agent session duration must be between 5 and 480 minutes");
         }
         self.session_minutes = session_minutes;
+        Ok(self)
+    }
+
+    pub fn with_workload_identity(
+        mut self,
+        workload_id: String,
+        spiffe_id: Option<String>,
+        spire_socket_path: Option<String>,
+    ) -> Result<Self> {
+        self.workload_identity = Some(WorkloadIdentityConfig::new(
+            workload_id,
+            spiffe_id,
+            spire_socket_path,
+        )?);
         Ok(self)
     }
 
@@ -134,6 +221,7 @@ impl NodeConfig {
             max_loop_iterations: 3,
             session_minutes: 30,
             allow_agent_override: true,
+            workload_identity: None,
         }
     }
 
@@ -204,5 +292,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn workload_identity_accepts_spiffe_metadata_and_rejects_bad_ids() {
+        let identity = WorkloadIdentityConfig::new(
+            "worker:reviewer".into(),
+            Some("spiffe://acme.example/company-mesh/reviewer".into()),
+            Some("unix:///run/spire/sockets/agent.sock".into()),
+        )
+        .unwrap();
+        assert_eq!(identity.workload_id, "worker:reviewer");
+        assert!(
+            WorkloadIdentityConfig::new(
+                "worker".into(),
+                Some("https://acme.example/worker".into()),
+                None,
+            )
+            .is_err()
+        );
+        let legacy: NodeConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "organization": "acme",
+            "node_name": "legacy",
+            "agent_id": "agent:legacy",
+            "permission_profile": "observer",
+            "enabled_actions": [],
+            "notifications": false,
+            "automatic_loop": false,
+            "max_loop_iterations": 3
+        }))
+        .unwrap();
+        assert!(legacy.workload_identity.is_none());
     }
 }
