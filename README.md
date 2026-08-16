@@ -1,11 +1,50 @@
+<div align="center">
+
 # Company Mesh
 
-Company Mesh is an installable, local-first MCP control plane for a company agent fleet.
-Each machine runs one `companyd` daemon. Daemons connect through authenticated Iroh QUIC.
-Local agents connect through a protected Unix socket and a bundled STDIO MCP adapter.
+**A secure, local-first collaboration layer for AI agent teams.**
 
-The current release is suitable for controlled teams and development data. It is not a
-credential broker. Do not put credential values in messages, memory, logs, or task artifacts.
+[![CI](https://github.com/LifeAnalysis/company-mesh/actions/workflows/ci.yml/badge.svg)](https://github.com/LifeAnalysis/company-mesh/actions/workflows/ci.yml)
+![Rust](https://img.shields.io/badge/core-Rust-000000?logo=rust)
+![MCP](https://img.shields.io/badge/interface-MCP-6C47FF)
+![Transport](https://img.shields.io/badge/transport-Iroh_QUIC-2563EB)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
+
+Let Codex, Claude Code, Claude Desktop, and other MCP clients work as a team—without
+sharing a shell, filesystem, long-lived session, or raw credential.
+
+</div>
+
+> [!IMPORTANT]
+> Company Mesh is suitable for controlled teams and development data. It is not yet a
+> credential broker. Never put credentials in messages, memory, logs, or task artifacts.
+
+## Why Company Mesh?
+
+Most agent systems coordinate a fleet or secure one agent loop. Company Mesh joins both
+layers. It gives each node a verifiable identity, a bounded permission profile, durable
+memory with provenance, independent review gates, and direct authenticated communication.
+
+| Need | Company Mesh control |
+|---|---|
+| Agent-to-agent communication | Signed messages over authenticated Iroh QUIC |
+| Safe colleague access | Expiring, single-use invitations and scoped peer capabilities |
+| Local control | Owner-only Unix socket and a local STDIO MCP adapter |
+| Sensitive actions | Touch ID/passkey approval bound to the exact request |
+| Limited remote CLI use | Project-, operation-, time-, and call-bound service grants |
+| Trustworthy completion | Dependency gates, deterministic tests, and independent review |
+| Company memory | Persistent SQLite records with provenance and redacted export |
+
+## What it feels like
+
+One agent can ask another:
+
+> “Can I use your registered Vercel inspection command for project X, three times, during
+> the next 30 minutes?”
+
+The owner approves the exact scope. Company Mesh validates the capability and typed
+parameters. It then starts only the registered executable in a sandbox. The requesting
+agent never receives the credential or arbitrary shell access.
 
 ## System shape
 
@@ -405,3 +444,7 @@ GitHub tag builds create checksums, keyless Sigstore signatures, and build prove
 See [PLAN.md](PLAN.md), [WORKTREE_EXECUTION_PLAN.md](docs/WORKTREE_EXECUTION_PLAN.md),
 [SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md), [THREAT_MODEL.md](docs/THREAT_MODEL.md),
 and [PROTOCOL.md](docs/PROTOCOL.md).
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
