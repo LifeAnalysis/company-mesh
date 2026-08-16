@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::{
     delegation::ServiceDefinition,
     model::{ALPN, Ack, Envelope, MAX_ENVELOPE_BYTES},
+    sandbox::{NoCredentialProvider, prepare_command},
     store::Store,
 };
 
@@ -249,24 +250,10 @@ async fn execute_service(
     if definition.executable_hash.is_empty() || actual_hash != definition.executable_hash {
         bail!("delegated service executable changed after registration");
     }
-    let template = definition
-        .operations
-        .get(operation)
-        .context("delegated operation is not registered")?;
-    let arguments = template
-        .iter()
-        .map(|argument| argument.replace("{project}", project))
-        .collect::<Vec<_>>();
-    let mut command = tokio::process::Command::new(&definition.executable);
-    command
-        .args(&arguments)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    let mut sandboxed = prepare_command(definition, operation, project, &NoCredentialProvider)?;
     let output = timeout(
         Duration::from_secs(definition.timeout_seconds),
-        command.output(),
+        sandboxed.command.output(),
     )
     .await
     .context("delegated service timed out")??;

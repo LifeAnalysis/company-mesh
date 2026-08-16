@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::{
     config::NodeConfig,
-    delegation::{ServiceDefinition, SignedServiceGrant},
+    delegation::{ServiceCapability, ServiceDefinition},
     invite::{CapabilityGrant, InviteClaims, SignedInvite},
     model::{Envelope, RpcRequest, RpcResponse},
     network::send_envelope,
@@ -267,8 +267,9 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
                 operation: String,
             }
             let p: P = serde_json::from_value(request.params.clone())?;
-            let token = state.store.lock().await.received_grant_token(&p.grant_id)?;
-            let grant = SignedServiceGrant::decode(&token)?;
+            let (token, issuer_endpoint) =
+                state.store.lock().await.received_grant_token(&p.grant_id)?;
+            let grant = ServiceCapability::decode(&token, &issuer_endpoint, Utc::now())?;
             let peer = state
                 .store
                 .lock()
