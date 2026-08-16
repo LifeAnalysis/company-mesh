@@ -38,9 +38,10 @@
 - Unknown, blocked, revoked, and out-of-scope peers fail closed.
 - Local MCP tools are filtered by the setup permission profile.
 - Invite, join, block, unblock, and revoke RPCs require a fresh WebAuthn assertion.
-- Mutating agent RPCs require an in-memory, time-limited session opened with verified
-  platform WebAuthn. Daemon restart and explicit lock remove the session.
-- Passkey challenges are action-bound, memory-resident, short-lived, and single-use.
+- Routine local mutations and external effects require separate in-memory sessions opened
+  with verified platform WebAuthn. Daemon restart and explicit lock remove both sessions.
+- Passkey challenges bind the method and exact parameter digest. They are memory-resident,
+  short-lived, and single-use.
 - The passkey private key stays in the platform authenticator. Agents never receive it.
 - Key rotation archives the old identity and state, then requires re-enrollment.
 - The optional agent loop has an iteration limit, timeout, output limit, and no shell.

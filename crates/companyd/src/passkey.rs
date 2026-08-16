@@ -43,12 +43,19 @@ struct AgentSession {
     expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope {
+    Routine,
+    External,
+}
+
 pub struct AdminGate {
     webauthn: Webauthn,
     store: PasskeyStore,
     store_path: std::path::PathBuf,
     pending: HashMap<Uuid, PendingApproval>,
-    agent_session: Option<AgentSession>,
+    routine_session: Option<AgentSession>,
+    external_session: Option<AgentSession>,
 }
 
 impl AdminGate {
@@ -59,7 +66,8 @@ impl AdminGate {
             store,
             store_path: path.to_owned(),
             pending: HashMap::new(),
-            agent_session: None,
+            routine_session: None,
+            external_session: None,
         })
     }
 
@@ -83,7 +91,7 @@ impl AdminGate {
         );
         Ok(json!({
             "challenge_id": challenge_id,
-            "action": action,
+            "binding": action,
             "expires_in_seconds": 180,
             "options": require_user_verification(serde_json::to_value(options)?)?,
         }))
@@ -110,54 +118,102 @@ impl AdminGate {
         Ok(())
     }
 
-    pub fn open_agent_session(&mut self, minutes: u16) -> Result<Value> {
+    pub fn open_agent_session(&mut self, scope: SessionScope, minutes: u16) -> Result<Value> {
         if !(5..=480).contains(&minutes) {
             bail!("agent session duration must be between 5 and 480 minutes");
         }
         let opened_at = Utc::now();
         let expires_at = opened_at + chrono::Duration::minutes(i64::from(minutes));
-        self.agent_session = Some(AgentSession {
+        let session = AgentSession {
             opened_at,
             expires_at,
-        });
+        };
+        *self.session_mut(scope) = Some(session);
         Ok(json!({
             "unlocked": true,
+            "scope": scope.name(),
             "opened_at": opened_at,
             "expires_at": expires_at,
             "session_minutes": minutes,
         }))
     }
 
-    pub fn agent_session_status(&mut self) -> Value {
+    pub fn agent_session_status(&mut self, scope: SessionScope) -> Value {
         let now = Utc::now();
         if self
-            .agent_session
+            .session(scope)
             .as_ref()
             .is_some_and(|session| session.expires_at <= now)
         {
-            self.agent_session = None;
+            *self.session_mut(scope) = None;
         }
-        match &self.agent_session {
+        match self.session(scope) {
             Some(session) => json!({
                 "unlocked": true,
+                "scope": scope.name(),
                 "opened_at": session.opened_at,
                 "expires_at": session.expires_at,
                 "remaining_seconds": (session.expires_at - now).num_seconds().max(0),
             }),
-            None => json!({"unlocked": false}),
+            None => json!({"unlocked": false, "scope": scope.name()}),
         }
     }
 
-    pub fn require_agent_session(&mut self) -> Result<()> {
-        if self.agent_session_status()["unlocked"] != true {
-            bail!("agent session is locked or expired; run company-mesh session unlock");
+    pub fn require_agent_session(&mut self, scope: SessionScope) -> Result<()> {
+        if self.agent_session_status(scope)["unlocked"] != true {
+            bail!(
+                "{} session is locked or expired; run company-mesh session {}",
+                scope.name(),
+                scope.unlock_command()
+            );
         }
         Ok(())
     }
 
-    pub fn lock_agent_session(&mut self) -> Value {
-        self.agent_session = None;
-        json!({"unlocked": false})
+    pub fn session_status(&mut self) -> Value {
+        json!({
+            "routine": self.agent_session_status(SessionScope::Routine),
+            "external": self.agent_session_status(SessionScope::External),
+        })
+    }
+
+    pub fn lock_agent_sessions(&mut self) -> Value {
+        self.routine_session = None;
+        self.external_session = None;
+        json!({
+            "routine": {"unlocked": false, "scope": "routine"},
+            "external": {"unlocked": false, "scope": "external"},
+        })
+    }
+
+    fn session(&self, scope: SessionScope) -> &Option<AgentSession> {
+        match scope {
+            SessionScope::Routine => &self.routine_session,
+            SessionScope::External => &self.external_session,
+        }
+    }
+
+    fn session_mut(&mut self, scope: SessionScope) -> &mut Option<AgentSession> {
+        match scope {
+            SessionScope::Routine => &mut self.routine_session,
+            SessionScope::External => &mut self.external_session,
+        }
+    }
+}
+
+impl SessionScope {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Routine => "routine",
+            Self::External => "external",
+        }
+    }
+
+    fn unlock_command(self) -> &'static str {
+        match self {
+            Self::Routine => "unlock",
+            Self::External => "unlock-external",
+        }
     }
 }
 
@@ -374,13 +430,16 @@ fn save_store(path: &Path, store: &PasskeyStore) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(store)?;
     #[cfg(unix)]
     let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file
     };
     #[cfg(not(unix))]
     let mut file = OpenOptions::new()
@@ -478,14 +537,17 @@ mod tests {
         assert!(gate.verify(approval.clone(), "peers.revoke").is_ok());
         assert!(gate.verify(approval, "peers.revoke").is_err());
 
-        assert!(gate.require_agent_session().is_err());
-        let session = gate.open_agent_session(5).unwrap();
+        assert!(gate.require_agent_session(SessionScope::Routine).is_err());
+        let session = gate.open_agent_session(SessionScope::Routine, 5).unwrap();
         assert_eq!(session["unlocked"], true);
-        assert!(gate.require_agent_session().is_ok());
-        gate.agent_session.as_mut().unwrap().expires_at = Utc::now() - chrono::Duration::seconds(1);
-        assert!(gate.require_agent_session().is_err());
-        gate.open_agent_session(5).unwrap();
-        assert_eq!(gate.lock_agent_session()["unlocked"], false);
-        assert!(gate.require_agent_session().is_err());
+        assert!(gate.require_agent_session(SessionScope::Routine).is_ok());
+        assert!(gate.require_agent_session(SessionScope::External).is_err());
+        gate.routine_session.as_mut().unwrap().expires_at =
+            Utc::now() - chrono::Duration::seconds(1);
+        assert!(gate.require_agent_session(SessionScope::Routine).is_err());
+        gate.open_agent_session(SessionScope::External, 5).unwrap();
+        assert_eq!(gate.session_status()["external"]["unlocked"], true);
+        gate.lock_agent_sessions();
+        assert!(gate.require_agent_session(SessionScope::External).is_err());
     }
 }

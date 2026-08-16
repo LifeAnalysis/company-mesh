@@ -10,9 +10,10 @@ cryptographic review.
 - Rust source, unsafe patterns, local socket handling, Iroh message handling, passkey
   approval, enrollment, capabilities, service files, installer, and release workflow.
 - `cargo clippy --workspace --all-targets -- -D warnings`.
-- `cargo test --workspace`: 27 tests, including platform sandbox execution, symlink-safe
-  owner-file writes, passkey action binding, replay rejection, capability enforcement,
-  durable adapters, knowledge redaction, and two-node Iroh exchange.
+- `cargo test --workspace`: 30 tests, including platform sandbox execution, symlink-safe
+  owner-file writes, exact passkey parameter binding, typed delegated parameters, replay
+  rejection, capability enforcement, durable adapters, knowledge redaction, and two-node
+  Iroh exchange.
 - `cargo audit`: no known vulnerable Rust crates. Two allowed maintenance warnings remain.
   `paste 1.0.15` is present on non-macOS Iroh dependency paths. `proc-macro-error2
   2.0.1` is a build-time dependency of `biscuit-auth` through `biscuit-quote`.
@@ -48,13 +49,15 @@ Remote Iroh work is limited to 64 concurrent connections. Local RPC work is limi
 32 clients. Connection, stream, read, write, and acknowledgement operations now have
 timeouts. Message sizes were already bounded.
 
-### High: long-lived agent mutation authority
+### High: long-lived and over-broad agent mutation authority
 
-Mutating agent methods now require an in-memory authorization session. Opening the
-session requires platform WebAuthn with user verification. The default absolute lifetime
-is 30 minutes. The daemon starts locked, restart locks it, and the operator can lock it
-immediately. High-risk peer administration still requires a separate action-bound
-assertion.
+Routine task, review, and memory mutations now use a separate in-memory session from
+external messages, delegation requests, and service calls. Opening either session
+requires platform WebAuthn with user verification. The defaults are 120 minutes for
+routine work and 15 minutes for external effects. The daemon starts locked, restart locks
+it, and the operator can lock both immediately. High-risk administration requires a
+fresh assertion bound to the complete parameter digest. The browser shows a safe action
+summary and never displays an invitation bearer value.
 
 ### Medium: mutable GitHub Actions
 

@@ -52,7 +52,19 @@ try {
   const identityB = await call(b.client, 'mesh_get_identity', {});
 
   const operationsPath = join(dataA, 'test-service-operations.json');
-  await writeFile(operationsPath, JSON.stringify({ inspect: ['delegated-project', '{project}'] }), { mode: 0o600 });
+  await writeFile(operationsPath, JSON.stringify({
+    inspect: {
+      arguments: ['delegated-project', '{project}', '{environment}', '{limit}'],
+      parameters: {
+        environment: {
+          type: 'string', allowed_values: ['preview', 'production'], max_length: 20,
+        },
+        limit: {
+          type: 'integer', pattern: '^[1-9][0-9]?$', max_length: 2,
+        },
+      },
+    },
+  }), { mode: 0o600 });
   await execFile('target/debug/company-mesh', [
     '--data-dir', dataA, 'delegation', 'register-service', '--name', 'test-cli',
     '--executable', '/bin/echo', '--operations-json', operationsPath,
@@ -69,14 +81,30 @@ try {
   const grants = grantsResponse.result ?? grantsResponse.items ?? grantsResponse;
   const grant = grants.find(item => item.service === 'test-cli' && item.project === 'company-mesh');
   if (!grant) throw new Error('Delegated service grant was not stored by node B.');
+  const invalidParameters = await b.client.callTool({
+    name: 'mesh_call_service',
+    arguments: {
+      grant_id: grant.grant_id, operation: 'inspect',
+      parameters: { environment: 'unknown', limit: 10 },
+    },
+  });
+  if (!invalidParameters.isError) {
+    throw new Error('A delegated value outside the registered allowlist was accepted.');
+  }
   const delegatedResult = await call(b.client, 'mesh_call_service', {
     grant_id: grant.grant_id, operation: 'inspect',
+    parameters: { environment: 'preview', limit: 10 },
   });
-  if (!delegatedResult.success || !delegatedResult.stdout.includes('delegated-project company-mesh')) {
+  if (!delegatedResult.success
+    || !delegatedResult.stdout.includes('delegated-project company-mesh preview 10')) {
     throw new Error(`Delegated project-scoped service execution failed: ${JSON.stringify(delegatedResult)}`);
   }
   const exhausted = await b.client.callTool({
-    name: 'mesh_call_service', arguments: { grant_id: grant.grant_id, operation: 'inspect' },
+    name: 'mesh_call_service',
+    arguments: {
+      grant_id: grant.grant_id, operation: 'inspect',
+      parameters: { environment: 'preview', limit: 10 },
+    },
   });
   if (!exhausted.isError) throw new Error('Exhausted delegated grant was accepted.');
 
@@ -93,7 +121,11 @@ try {
     '--data-dir', dataA, 'delegation', 'revoke', '--grant-id', revocableGrant.grant_id,
   ]);
   const revoked = await b.client.callTool({
-    name: 'mesh_call_service', arguments: { grant_id: revocableGrant.grant_id, operation: 'inspect' },
+    name: 'mesh_call_service',
+    arguments: {
+      grant_id: revocableGrant.grant_id, operation: 'inspect',
+      parameters: { environment: 'preview', limit: 10 },
+    },
   });
   if (!revoked.isError) throw new Error('Revoked delegated grant was accepted.');
   await call(a.client, 'mesh_send_peer_message', {
@@ -170,6 +202,7 @@ try {
     self_review_rejected: true,
     independent_review: 'passed',
     delegated_project_service: 'passed',
+    delegated_parameter_validation: 'passed',
     delegated_grant_exhaustion: 'passed',
     delegated_grant_revocation: 'passed',
     next_ready_task: second,

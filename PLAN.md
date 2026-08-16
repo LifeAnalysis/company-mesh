@@ -18,9 +18,10 @@ The fleet graph schedules work. Each node runs a bounded loop. The memory layer 
 8. The event log is append-only.
 9. Tool failures are typed failures.
 10. The daemon fails closed for invalid messages and state transitions.
-11. Administrator actions require a fresh action-bound passkey assertion.
+11. Administrator actions require a fresh passkey assertion bound to the exact parameters.
 12. The passkey private key never enters model context or daemon storage.
-13. Mutating agent work requires a short in-memory session opened by verified WebAuthn.
+13. Routine mutations and external effects use separate in-memory sessions opened by
+    verified WebAuthn.
 
 ## Implementation status
 

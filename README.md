@@ -64,7 +64,8 @@ company-mesh setup \
   --spiffe-id spiffe://acme.example/company-mesh/node-a \
   --spire-socket-path unix:///run/spire/sockets/agent.sock \
   --permissions collaborator \
-  --session-minutes 30 \
+  --routine-session-minutes 120 \
+  --external-session-minutes 15 \
   --notifications \
   --configure-all-clients \
   --mcp-adapter "$HOME/.local/share/company-mesh/company-mcp.mjs" \
@@ -86,18 +87,25 @@ The workload fields reserve a stable identity binding for a future SPIRE Workloa
 adapter. They are metadata today, appear in `mesh_get_identity`, and are not accepted as
 authentication evidence. Omit all three flags when SPIRE is not being planned.
 
-## Touch ID and timed sessions
+## Touch ID and risk-based sessions
 
-The daemon starts with its agent mutation session locked. Unlock it before an agent can
-create or claim tasks, submit work, record reviews, propose memory, or send peer messages:
+The daemon starts with both agent sessions locked. Unlock the routine session for local
+task, review, and memory work:
 
 ```sh
 company-mesh session unlock
 ```
 
+Unlock the shorter external session only before peer messages, delegation requests, or
+delegated service calls:
+
+```sh
+company-mesh session unlock-external
+```
+
 The browser requests a platform authenticator with required user verification. On a Mac,
-this normally uses Touch ID. The session expires after `--session-minutes`; the default is
-30 minutes and the allowed range is 5 to 480 minutes. Read operations remain available.
+this normally uses Touch ID. The routine session defaults to 120 minutes. The external
+session defaults to 15 minutes. Read operations remain available while both are locked.
 
 Check or close the session:
 
@@ -106,9 +114,12 @@ company-mesh session status
 company-mesh session lock
 ```
 
-The daemon keeps the session only in memory. A daemon restart locks it. Invite creation,
+The daemon keeps both sessions only in memory. A daemon restart or `session lock` locks
+both. Invite creation,
 joining, peer blocking, peer revocation, key rotation, and setup changes still require a
-fresh action-bound passkey approval even during an unlocked session.
+fresh passkey approval even during an unlocked session. The approval is bound to a digest
+of the exact parameters. Changing a request ID, operation, duration, limit, peer, or
+service invalidates the approval.
 
 ## Supported agent clients
 
@@ -208,10 +219,37 @@ giving another agent shell access. For example, the owner creates an operations 
 
 ```json
 {
-  "inspect": ["project", "inspect", "{project}"],
+  "inspect": {
+    "arguments": [
+      "project",
+      "inspect",
+      "{project}",
+      "--environment",
+      "{environment}",
+      "--limit",
+      "{limit}"
+    ],
+    "parameters": {
+      "environment": {
+        "type": "string",
+        "allowed_values": ["preview", "production"],
+        "max_length": 20
+      },
+      "limit": {
+        "type": "integer",
+        "pattern": "^[1-9][0-9]?$",
+        "max_length": 2
+      }
+    }
+  },
   "list-deployments": ["list", "{project}"]
 }
 ```
+
+The array form remains valid for operations that need only the bound project. Typed
+operations accept strings, integers, and booleans. They reject extra fields, missing
+required fields, invalid types, values outside an allowlist or regular expression,
+control characters, overlong values, and leading hyphens unless explicitly enabled.
 
 The owner registers it. Registration requires a fresh Touch ID approval:
 
@@ -231,7 +269,8 @@ Prefer a standalone executable when one is available. Do not add a path that con
 credentials.
 
 The requesting agent uses `mesh_request_service_access`. The request appears in the
-owner's verified inbox. The owner approves a strict subset:
+owner's verified inbox. External access must be unlocked first. The owner approves a
+strict subset:
 
 ```sh
 company-mesh delegation approve \
@@ -247,7 +286,8 @@ credential-provider interface exists, but this release does not include a Vercel
 Keychain, Vault, or OpenBao provider. The example can run only an operation that does not
 need a credential until one of those providers is implemented. The daemon checks the peer,
 project, operation, expiry, call count, registered executable digest, timeout, and output
-limit. It starts the executable
+limit. Typed values are validated before they become direct process arguments. It starts
+the executable
 directly in `sandbox-exec` on macOS or Bubblewrap on Linux. It clears the environment,
 uses a temporary working directory, and does not use a shell or accept arbitrary
 arguments.

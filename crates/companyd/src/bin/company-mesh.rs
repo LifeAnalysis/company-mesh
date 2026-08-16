@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use companyd::{
     config::{NodeConfig, PermissionProfile},
+    delegation::ServiceOperation,
     identity::load_or_create_secret,
     passkey::{AdminApproval, authenticate_interactive, collect_assertion, register_interactive},
     service,
@@ -64,8 +65,12 @@ enum Commands {
         automatic_loop: bool,
         #[arg(long, default_value_t = 3)]
         max_loop_iterations: u8,
-        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u16).range(5..=480))]
+        /// Routine task, review, and memory session lifetime.
+        #[arg(long = "routine-session-minutes", alias = "session-minutes", default_value_t = 120, value_parser = clap::value_parser!(u16).range(15..=480))]
         session_minutes: u16,
+        /// External message, delegation, and service-call session lifetime.
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u16).range(5..=60))]
+        external_session_minutes: u16,
         #[arg(long)]
         configure_codex: bool,
         #[arg(long)]
@@ -172,6 +177,7 @@ enum KeyCommand {
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     Unlock,
+    UnlockExternal,
     Status,
     Lock,
 }
@@ -240,6 +246,7 @@ async fn main() -> Result<()> {
             automatic_loop,
             max_loop_iterations,
             session_minutes,
+            external_session_minutes,
             configure_codex,
             configure_claude_code,
             configure_claude_desktop,
@@ -285,7 +292,8 @@ async fn main() -> Result<()> {
                 automatic_loop,
                 max_loop_iterations,
             )?
-            .with_session_minutes(session_minutes)?;
+            .with_session_minutes(session_minutes)?
+            .with_external_session_minutes(external_session_minutes)?;
             if workload_id.is_some() || spiffe_id.is_some() || spire_socket_path.is_some() {
                 let workload_id = workload_id.unwrap_or_else(|| config.agent_id.clone());
                 config =
@@ -407,6 +415,7 @@ async fn main() -> Result<()> {
         Commands::Session { command } => {
             let (method, protected) = match command {
                 SessionCommand::Unlock => ("session.unlock", true),
+                SessionCommand::UnlockExternal => ("session.unlock-external", true),
                 SessionCommand::Status => ("session.status", false),
                 SessionCommand::Lock => ("session.lock", false),
             };
@@ -427,7 +436,7 @@ async fn main() -> Result<()> {
                 allow_network,
                 read_only_paths,
             } => {
-                let operations: std::collections::BTreeMap<String, Vec<String>> =
+                let operations: std::collections::BTreeMap<String, ServiceOperation> =
                     serde_json::from_slice(&std::fs::read(&operations_json)?)?;
                 let result = rpc_admin(
                     &data_dir,
@@ -610,7 +619,11 @@ fn permission_summary(config: &NodeConfig, endpoint: &str, data_dir: &Path, pass
     eprintln!("  Data          {}", data_dir.display());
     eprintln!("  Notifications {}", on_off(config.notifications));
     eprintln!("  Agent loop    {}", on_off(config.automatic_loop));
-    eprintln!("  Session       {} minutes", config.session_minutes);
+    eprintln!("  Routine       {} minutes", config.session_minutes);
+    eprintln!(
+        "  External      {} minutes",
+        config.external_session_minutes
+    );
     eprintln!("  Passkey gate  {}", on_off(passkey_enabled));
     eprintln!();
     eprintln!("{}", style("Access").bold());
@@ -623,7 +636,7 @@ fn permission_summary(config: &NodeConfig, endpoint: &str, data_dir: &Path, pass
     eprintln!("{}", style("Next").bold());
     eprintln!("  1. Start the daemon or install the user service.");
     eprintln!("  2. Run `company-mesh session unlock` before agent writes.");
-    eprintln!("  3. Run `company-mesh status` to check the node.");
+    eprintln!("  3. Unlock external actions only when required.");
     eprintln!();
 }
 
@@ -826,19 +839,30 @@ async fn rpc(data_dir: &Path, method: &str, params: Value) -> Result<Value> {
 }
 
 async fn rpc_admin(data_dir: &Path, method: &str, params: Value) -> Result<Value> {
-    let challenge = rpc(data_dir, "admin.challenge", json!({"action": method})).await?;
+    let challenge = rpc(
+        data_dir,
+        "admin.challenge",
+        json!({"action": method, "params": params.clone()}),
+    )
+    .await?;
     if challenge["development_bypass"] == true {
         return rpc_with_approval(data_dir, method, params, None).await;
     }
     let challenge_id: Uuid = serde_json::from_value(challenge["challenge_id"].clone())?;
-    let credential = collect_assertion(challenge["options"].clone(), method).await?;
+    let binding = challenge["binding"]
+        .as_str()
+        .context("daemon omitted approval binding")?;
+    let summary = challenge["summary"]
+        .as_str()
+        .context("daemon omitted approval summary")?;
+    let credential = collect_assertion(challenge["options"].clone(), summary).await?;
     rpc_with_approval(
         data_dir,
         method,
         params,
         Some(AdminApproval {
             challenge_id,
-            action: method.to_owned(),
+            action: binding.to_owned(),
             credential,
         }),
     )

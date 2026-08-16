@@ -19,7 +19,7 @@ use crate::{
     invite::{CapabilityGrant, InviteClaims, SignedInvite},
     model::{Envelope, RpcRequest, RpcResponse},
     network::send_envelope,
-    passkey::AdminGate,
+    passkey::{AdminGate, SessionScope},
     store::{MemoryProposal, Store},
 };
 
@@ -100,6 +100,8 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
         #[derive(Deserialize)]
         struct P {
             action: String,
+            #[serde(default)]
+            params: Value,
         }
         let p: P = serde_json::from_value(request.params.clone())?;
         if !admin_required(&p.action) || !state.config.allows(&p.action) {
@@ -108,7 +110,10 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
         let Some(gate) = state.admin_gate.as_ref() else {
             return Ok(json!({"development_bypass": true, "action": p.action}));
         };
-        return gate.lock().await.begin(&p.action);
+        let binding = approval_binding(&p.action, &p.params)?;
+        let mut challenge = gate.lock().await.begin(&binding)?;
+        challenge["summary"] = Value::String(approval_summary(&p.action, &p.params));
+        return Ok(challenge);
     }
     if admin_required(&request.method)
         && let Some(gate) = &state.admin_gate
@@ -117,7 +122,8 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
             .approval
             .clone()
             .context("fresh administrator passkey approval is required")?;
-        gate.lock().await.verify(approval, &request.method)?;
+        let binding = approval_binding(&request.method, &request.params)?;
+        gate.lock().await.verify(approval, &binding)?;
     }
     if !state.config.allows(&request.method) {
         bail!(
@@ -126,10 +132,10 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
             request.method
         );
     }
-    if agent_session_required(&request.method)
+    if let Some(scope) = session_scope(&request.method)
         && let Some(gate) = &state.admin_gate
     {
-        gate.lock().await.require_agent_session()?;
+        gate.lock().await.require_agent_session(scope)?;
     }
     let actor = if state.config.allow_agent_override {
         request.agent_id.as_str()
@@ -144,19 +150,38 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
             };
             gate.lock()
                 .await
-                .open_agent_session(state.config.session_minutes)
+                .open_agent_session(SessionScope::Routine, state.config.session_minutes)
+        }
+        "session.unlock-external" => {
+            let Some(gate) = &state.admin_gate else {
+                return Ok(
+                    json!({"unlocked": true, "scope": "external", "development_bypass": true}),
+                );
+            };
+            gate.lock().await.open_agent_session(
+                SessionScope::External,
+                state.config.external_session_minutes,
+            )
         }
         "session.status" => {
             let Some(gate) = &state.admin_gate else {
-                return Ok(json!({"unlocked": true, "development_bypass": true}));
+                return Ok(json!({
+                    "routine": {"unlocked": true, "scope": "routine"},
+                    "external": {"unlocked": true, "scope": "external"},
+                    "development_bypass": true,
+                }));
             };
-            Ok(gate.lock().await.agent_session_status())
+            Ok(gate.lock().await.session_status())
         }
         "session.lock" => {
             let Some(gate) = &state.admin_gate else {
-                return Ok(json!({"unlocked": false, "development_bypass": true}));
+                return Ok(json!({
+                    "routine": {"unlocked": false, "scope": "routine"},
+                    "external": {"unlocked": false, "scope": "external"},
+                    "development_bypass": true,
+                }));
             };
-            Ok(gate.lock().await.lock_agent_session())
+            Ok(gate.lock().await.lock_agent_sessions())
         }
         "services.register" => {
             let definition: ServiceDefinition = serde_json::from_value(request.params.clone())?;
@@ -265,6 +290,8 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
             struct P {
                 grant_id: String,
                 operation: String,
+                #[serde(default = "empty_object")]
+                parameters: Value,
             }
             let p: P = serde_json::from_value(request.params.clone())?;
             let (token, issuer_endpoint) =
@@ -282,7 +309,12 @@ async fn handle_inner(request: &RpcRequest, state: &AppState) -> Result<Value> {
                 actor,
                 "message",
                 scope,
-                json!({"type":"service_request","grant_token":token,"operation":p.operation}),
+                json!({
+                    "type":"service_request",
+                    "grant_token":token,
+                    "operation":p.operation,
+                    "parameters":p.parameters,
+                }),
                 Some(peer.outbound.capability_id),
             )?;
             let ack = send_envelope(&state.endpoint, peer.endpoint_addr, &envelope).await?;
@@ -571,6 +603,7 @@ fn admin_required(method: &str) -> bool {
     matches!(
         method,
         "session.unlock"
+            | "session.unlock-external"
             | "delegations.approve"
             | "delegations.revoke"
             | "invites.create"
@@ -582,18 +615,93 @@ fn admin_required(method: &str) -> bool {
     )
 }
 
-fn agent_session_required(method: &str) -> bool {
-    matches!(
+fn session_scope(method: &str) -> Option<SessionScope> {
+    if matches!(
         method,
-        "tasks.create"
-            | "delegations.request"
-            | "tasks.claim"
-            | "tasks.submit"
-            | "reviews.record"
-            | "memory.propose"
-            | "peer.send"
-            | "services.call"
-    )
+        "tasks.create" | "tasks.claim" | "tasks.submit" | "reviews.record" | "memory.propose"
+    ) {
+        Some(SessionScope::Routine)
+    } else if matches!(
+        method,
+        "delegations.request" | "peer.send" | "services.call"
+    ) {
+        Some(SessionScope::External)
+    } else {
+        None
+    }
+}
+
+fn approval_binding(method: &str, params: &Value) -> Result<String> {
+    let digest = blake3::hash(&serde_json::to_vec(params)?);
+    Ok(format!("{method}:{}", digest.to_hex()))
+}
+
+fn empty_object() -> Value {
+    json!({})
+}
+
+fn approval_summary(method: &str, params: &Value) -> String {
+    let text = |key: &str| short_text(params[key].as_str().unwrap_or("unspecified"));
+    match method {
+        "session.unlock" => "Unlock routine agent work".to_owned(),
+        "session.unlock-external" => "Unlock external messages and service calls".to_owned(),
+        "delegations.approve" => format!(
+            "Approve request {} for operations [{}], {} minutes, and at most {} calls",
+            text("request_id"),
+            string_list(&params["operations"]),
+            params["expires_minutes"].as_i64().unwrap_or_default(),
+            params["max_calls"].as_u64().unwrap_or_default()
+        ),
+        "delegations.revoke" => format!("Revoke service grant {}", text("grant_id")),
+        "services.register" => format!(
+            "Register service {} with operations [{}]; network {}",
+            text("name"),
+            object_keys(&params["operations"]),
+            if params["allow_network"].as_bool().unwrap_or(false) {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        "invites.create" => format!(
+            "Create invite for {} with scopes [{}] for {} hours",
+            text("invitee_label"),
+            string_list(&params["scopes"]),
+            params["expires_hours"].as_i64().unwrap_or_default()
+        ),
+        "peers.join" => "Join using the supplied private invitation".to_owned(),
+        "peers.block" => format!("Block peer {}", text("endpoint_id")),
+        "peers.unblock" => format!("Unblock peer {}", text("endpoint_id")),
+        "peers.revoke" => format!("Revoke peer {}", text("endpoint_id")),
+        _ => format!("Approve protected action {method}"),
+    }
+}
+
+fn short_text(value: &str) -> String {
+    value.chars().take(80).collect()
+}
+
+fn string_list(value: &Value) -> String {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(8)
+        .map(short_text)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn object_keys(value: &Value) -> String {
+    value
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.keys())
+        .take(8)
+        .map(|key| short_text(key))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn classify_error(error: &anyhow::Error) -> &'static str {
@@ -609,5 +717,41 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         "method_not_found"
     } else {
         "invalid_request"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn administrator_binding_changes_with_exact_parameters() {
+        let first = json!({
+            "request_id": "request-a",
+            "operations": ["inspect"],
+            "expires_minutes": 15,
+            "max_calls": 2,
+        });
+        let changed = json!({
+            "request_id": "request-a",
+            "operations": ["inspect"],
+            "expires_minutes": 15,
+            "max_calls": 3,
+        });
+        assert_eq!(
+            approval_binding("delegations.approve", &first).unwrap(),
+            approval_binding("delegations.approve", &first).unwrap()
+        );
+        assert_ne!(
+            approval_binding("delegations.approve", &first).unwrap(),
+            approval_binding("delegations.approve", &changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn invitation_summary_does_not_include_the_bearer_value() {
+        let params = json!({"token": "not-for-display"});
+        let summary = approval_summary("peers.join", &params);
+        assert!(!summary.contains("not-for-display"));
     }
 }

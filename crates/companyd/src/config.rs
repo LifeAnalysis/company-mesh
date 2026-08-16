@@ -16,6 +16,8 @@ pub struct NodeConfig {
     pub max_loop_iterations: u8,
     #[serde(default = "default_session_minutes")]
     pub session_minutes: u16,
+    #[serde(default = "default_external_session_minutes")]
+    pub external_session_minutes: u16,
     #[serde(default)]
     pub allow_agent_override: bool,
     #[serde(default)]
@@ -114,6 +116,7 @@ impl PermissionProfile {
             "session.lock",
             "session.status",
             "session.unlock",
+            "session.unlock-external",
         ];
         let collaborate = [
             "tasks.create",
@@ -171,7 +174,7 @@ impl NodeConfig {
             bail!("automatic loop iterations must be between 1 and 10");
         }
         Ok(Self {
-            version: 1,
+            version: 2,
             organization,
             node_name,
             agent_id,
@@ -181,16 +184,25 @@ impl NodeConfig {
             automatic_loop,
             max_loop_iterations,
             session_minutes: default_session_minutes(),
+            external_session_minutes: default_external_session_minutes(),
             allow_agent_override: false,
             workload_identity: None,
         })
     }
 
     pub fn with_session_minutes(mut self, session_minutes: u16) -> Result<Self> {
-        if !(5..=480).contains(&session_minutes) {
-            bail!("agent session duration must be between 5 and 480 minutes");
+        if !(15..=480).contains(&session_minutes) {
+            bail!("routine session duration must be between 15 and 480 minutes");
         }
         self.session_minutes = session_minutes;
+        Ok(self)
+    }
+
+    pub fn with_external_session_minutes(mut self, minutes: u16) -> Result<Self> {
+        if !(5..=60).contains(&minutes) {
+            bail!("external session duration must be between 5 and 60 minutes");
+        }
+        self.external_session_minutes = minutes;
         Ok(self)
     }
 
@@ -210,7 +222,7 @@ impl NodeConfig {
 
     pub fn developer(node_name: String) -> Self {
         Self {
-            version: 1,
+            version: 2,
             organization: "development".to_owned(),
             node_name,
             agent_id: "agent:developer".to_owned(),
@@ -220,6 +232,7 @@ impl NodeConfig {
             automatic_loop: false,
             max_loop_iterations: 3,
             session_minutes: 30,
+            external_session_minutes: 10,
             allow_agent_override: true,
             workload_identity: None,
         }
@@ -231,20 +244,34 @@ impl NodeConfig {
 
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+        let mut config: Self =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        if !(15..=480).contains(&config.session_minutes)
+            || !(5..=60).contains(&config.external_session_minutes)
+        {
+            bail!("configured session duration is outside the safe range");
+        }
+        // Action sets are derived from the profile. Refreshing them makes new
+        // safety actions available after an upgrade without broadening the profile.
+        config.enabled_actions = config.permission_profile.actions();
+        config.version = 2;
+        Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(self)?;
         #[cfg(unix)]
         let mut file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            OpenOptions::new()
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(path)?
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file
         };
         #[cfg(not(unix))]
         let mut file = OpenOptions::new()
@@ -259,7 +286,11 @@ impl NodeConfig {
 }
 
 const fn default_session_minutes() -> u16 {
-    30
+    120
+}
+
+const fn default_external_session_minutes() -> u16 {
+    15
 }
 
 #[cfg(test)]
@@ -324,5 +355,14 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.workload_identity.is_none());
+        assert_eq!(legacy.session_minutes, 120);
+        assert_eq!(legacy.external_session_minutes, 15);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let upgraded = NodeConfig::load(&path).unwrap();
+        assert_eq!(upgraded.version, 2);
+        assert!(upgraded.allows("session.unlock-external"));
     }
 }

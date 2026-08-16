@@ -6,6 +6,7 @@ use std::{
     process::Stdio,
 };
 
+use serde_json::Value;
 use tempfile::TempDir;
 use thiserror::Error;
 use tokio::process::Command;
@@ -135,16 +136,20 @@ pub fn prepare_command(
     definition: &ServiceDefinition,
     operation: &str,
     project: &str,
+    parameters: &Value,
     provider: &dyn CredentialProvider,
 ) -> Result<SandboxedCommand, SandboxError> {
     let backend = SandboxBackend::detect()?;
-    prepare_command_with_backend(definition, operation, project, provider, backend)
+    prepare_command_with_backend(
+        definition, operation, project, parameters, provider, backend,
+    )
 }
 
 fn prepare_command_with_backend(
     definition: &ServiceDefinition,
     operation: &str,
     project: &str,
+    parameters: &Value,
     provider: &dyn CredentialProvider,
     backend: SandboxBackend,
 ) -> Result<SandboxedCommand, SandboxError> {
@@ -157,14 +162,13 @@ fn prepare_command_with_backend(
         },
         &mut lease,
     )?;
-    let template = definition
+    let operation = definition
         .operations
         .get(operation)
         .ok_or_else(|| SandboxError::CredentialProvider("operation is not registered".into()))?;
-    let arguments = template
-        .iter()
-        .map(|argument| argument.replace("{project}", project))
-        .collect::<Vec<_>>();
+    let arguments = operation
+        .render(project, parameters)
+        .map_err(|error| SandboxError::CredentialProvider(error.to_string()))?;
     let mut command = match backend {
         SandboxBackend::MacOs => macos_command(definition, &arguments, &mut lease)?,
         SandboxBackend::LinuxBubblewrap => linux_command(definition, &arguments, &lease),
@@ -334,6 +338,7 @@ fn set_owner_only_directory(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delegation::ServiceOperation;
     use std::os::unix::fs::PermissionsExt;
 
     fn definition() -> ServiceDefinition {
@@ -343,7 +348,7 @@ mod tests {
             executable_hash: "not-used-by-command-builder".to_owned(),
             operations: BTreeMap::from([(
                 "inspect".to_owned(),
-                vec!["%s".to_owned(), "{project}".to_owned()],
+                ServiceOperation::Legacy(vec!["%s".to_owned(), "{project}".to_owned()]),
             )]),
             timeout_seconds: 1,
             max_output_bytes: 1024,
@@ -383,6 +388,7 @@ mod tests {
             &definition(),
             "inspect",
             "mesh",
+            &serde_json::json!({}),
             &NoCredentialProvider,
             SandboxBackend::MacOs,
         )
@@ -414,6 +420,7 @@ mod tests {
             &service,
             "inspect",
             "mesh",
+            &serde_json::json!({}),
             &NoCredentialProvider,
             SandboxBackend::MacOs,
         )
@@ -433,6 +440,7 @@ mod tests {
             &definition(),
             "inspect",
             "mesh",
+            &serde_json::json!({}),
             &NoCredentialProvider,
             SandboxBackend::MacOs,
         )

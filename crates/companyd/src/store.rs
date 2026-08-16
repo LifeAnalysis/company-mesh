@@ -755,14 +755,12 @@ impl Store {
         {
             bail!("invalid delegated service definition");
         }
-        if definition.operations.iter().any(|(name, args)| {
-            name.is_empty()
-                || args.is_empty()
-                || args
-                    .iter()
-                    .any(|arg| arg.contains('{') && arg != "{project}")
-        }) {
-            bail!("operation arguments may contain only the exact {{project}} placeholder");
+        if definition
+            .operations
+            .iter()
+            .any(|(name, operation)| name.is_empty() || operation.validate().is_err())
+        {
+            bail!("invalid delegated service operation or typed parameter rule");
         }
         if definition.read_only_paths.iter().any(|path| {
             !std::path::Path::new(path).is_absolute() || !std::path::Path::new(path).exists()
@@ -948,6 +946,7 @@ impl Store {
         remote_endpoint: &str,
         token: &str,
         operation: &str,
+        parameters: &Value,
     ) -> Result<(ServiceDefinition, String)> {
         let now = Utc::now();
         let grant = ServiceCapability::decode(token, &self.secret.public().to_string(), now)?;
@@ -975,6 +974,11 @@ impl Store {
             &grant.claims.service,
             operation,
         )?;
+        definition
+            .operations
+            .get(operation)
+            .context("service operation is no longer registered")?
+            .render(&grant.claims.project, parameters)?;
         self.conn.execute(
             "UPDATE service_grants SET calls_used=calls_used+1 WHERE grant_id=?1",
             [grant.claims.grant_id.to_string()],

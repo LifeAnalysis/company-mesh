@@ -37,8 +37,11 @@ endpoint, service, project, operations, expiry, and maximum calls.
 
 Grant tokens are stored by daemons and are redacted from inbox records. Service calls
 carry the token inside the signed and encrypted Iroh envelope. The issuing daemon checks
-the grant again and runs only a pre-registered executable and fixed argument template.
-`{project}` is the only supported placeholder. No shell text or caller arguments exist.
+the grant again and runs only a pre-registered executable and argument schema. `{project}`
+is bound by the grant. Registered scalar parameters are required and checked against
+their type, length, allowlist, regular expression, and leading-hyphen rule. Unknown
+parameters fail closed. Valid values become separate process arguments. No shell text
+exists.
 
 Protocol 1 accepts authorized peer messages into a quarantine inbox only. It has no remote
 tool invocation. Task offers, results, and memory episodes remain reserved until separate

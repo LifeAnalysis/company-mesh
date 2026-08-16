@@ -127,6 +127,11 @@ pub async fn accept_loop(
                                 let operation = envelope.payload["operation"]
                                     .as_str()
                                     .context("service request omitted operation")?;
+                                let parameters = envelope
+                                    .payload
+                                    .get("parameters")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({}));
                                 let (definition, project, label) = {
                                     let store = store.lock().await;
                                     let peer = store.authorize_inbound(
@@ -139,11 +144,13 @@ pub async fn accept_loop(
                                         &envelope.sender_endpoint,
                                         token,
                                         operation,
+                                        &parameters,
                                     )?;
                                     (definition, project, peer.label)
                                 };
                                 let output =
-                                    execute_service(&definition, operation, &project).await?;
+                                    execute_service(&definition, operation, &project, &parameters)
+                                        .await?;
                                 Ok((Some(label), Some(output)))
                             } else {
                                 let store = store.lock().await;
@@ -243,6 +250,7 @@ async fn execute_service(
     definition: &ServiceDefinition,
     operation: &str,
     project: &str,
+    parameters: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let actual_hash = blake3::hash(&std::fs::read(&definition.executable)?)
         .to_hex()
@@ -250,7 +258,13 @@ async fn execute_service(
     if definition.executable_hash.is_empty() || actual_hash != definition.executable_hash {
         bail!("delegated service executable changed after registration");
     }
-    let mut sandboxed = prepare_command(definition, operation, project, &NoCredentialProvider)?;
+    let mut sandboxed = prepare_command(
+        definition,
+        operation,
+        project,
+        parameters,
+        &NoCredentialProvider,
+    )?;
     let output = timeout(
         Duration::from_secs(definition.timeout_seconds),
         sandboxed.command.output(),
