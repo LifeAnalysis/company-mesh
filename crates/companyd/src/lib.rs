@@ -7,5 +7,6 @@ pub mod network;
 pub mod notify;
 pub mod passkey;
 pub mod rpc;
+pub mod sandbox;
 pub mod service;
 pub mod store;

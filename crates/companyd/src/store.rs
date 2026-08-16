@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    delegation::{ServiceDefinition, ServiceGrantClaims, SignedServiceGrant},
+    delegation::{
+        ServiceCapability, ServiceCapabilityClaims, ServiceDefinition, authorize_with_cedar,
+        generated_service_policy,
+    },
     invite::{CapabilityGrant, SignedInvite},
     model::valid_scope,
 };
@@ -735,6 +738,22 @@ impl Store {
         stored.executable_hash = blake3::hash(&std::fs::read(&stored.executable)?)
             .to_hex()
             .to_string();
+        if stored.cedar_policy.trim().is_empty() {
+            stored.cedar_policy =
+                generated_service_policy(&stored.name, stored.operations.keys().cloned());
+        }
+        // Parsing and one known-allow evaluation make invalid policy a registration error.
+        let first_operation = stored
+            .operations
+            .keys()
+            .next()
+            .context("service has no operations")?;
+        authorize_with_cedar(
+            &stored.cedar_policy,
+            "registration-check",
+            &stored.name,
+            first_operation,
+        )?;
         self.conn.execute(
             "INSERT INTO delegated_services(name,definition,updated_at) VALUES(?1,?2,?3)
              ON CONFLICT(name) DO UPDATE SET definition=excluded.definition,updated_at=excluded.updated_at",
@@ -791,9 +810,9 @@ impl Store {
             .peer(&sender_endpoint)?
             .context("requesting peer is not enrolled")?;
         let now = Utc::now();
-        let grant = SignedServiceGrant::issue(
+        let grant = ServiceCapability::issue(
             &self.secret,
-            ServiceGrantClaims {
+            ServiceCapabilityClaims {
                 grant_id: Uuid::new_v4(),
                 issuer_endpoint: self.secret.public().to_string(),
                 grantee_endpoint: sender_endpoint.clone(),
@@ -805,7 +824,7 @@ impl Store {
                 max_calls,
             },
         )?;
-        let token = grant.encode()?;
+        let token = grant.encode().to_owned();
         self.insert_service_grant("issued", &sender_endpoint, &token, &grant)?;
         let details = json!({
             "grant_id": grant.claims.grant_id,
@@ -820,7 +839,7 @@ impl Store {
     }
 
     pub fn accept_service_grant(&self, remote_endpoint: &str, token: &str) -> Result<Value> {
-        let grant = SignedServiceGrant::decode(token)?;
+        let grant = ServiceCapability::decode(token, remote_endpoint, Utc::now())?;
         if grant.claims.issuer_endpoint != remote_endpoint
             || grant.claims.grantee_endpoint != self.secret.public().to_string()
         {
@@ -842,7 +861,7 @@ impl Store {
         direction: &str,
         peer_endpoint: &str,
         token: &str,
-        grant: &SignedServiceGrant,
+        grant: &ServiceCapability,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO service_grants(grant_id,direction,peer_endpoint,token,service,project,operations,expires_at,max_calls,calls_used,status,created_at)
@@ -882,10 +901,10 @@ impl Store {
         Ok(value)
     }
 
-    pub fn received_grant_token(&self, grant_id: &str) -> Result<String> {
+    pub fn received_grant_token(&self, grant_id: &str) -> Result<(String, String)> {
         self.conn.query_row(
-            "SELECT token FROM service_grants WHERE grant_id=?1 AND direction='received' AND status='active' AND expires_at>?2",
-            params![grant_id, Utc::now().to_rfc3339()], |row| row.get(0),
+            "SELECT token,peer_endpoint FROM service_grants WHERE grant_id=?1 AND direction='received' AND status='active' AND expires_at>?2",
+            params![grant_id, Utc::now().to_rfc3339()], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?.context("service grant is unknown, inactive, or expired")
     }
 
@@ -895,17 +914,15 @@ impl Store {
         token: &str,
         operation: &str,
     ) -> Result<(ServiceDefinition, String)> {
-        let grant = SignedServiceGrant::decode(token)?;
-        if grant.claims.issuer_endpoint != self.secret.public().to_string()
-            || grant.claims.grantee_endpoint != remote_endpoint
-            || !grant
-                .claims
-                .operations
-                .iter()
-                .any(|value| value == operation)
-        {
-            bail!("service grant does not authorize this caller or operation");
-        }
+        let now = Utc::now();
+        let grant = ServiceCapability::decode(token, &self.secret.public().to_string(), now)?;
+        grant.authorize_call(
+            remote_endpoint,
+            &grant.claims.service,
+            &grant.claims.project,
+            operation,
+            now,
+        )?;
         let (calls, max_calls, status): (u32, u32, String) = self.conn.query_row(
             "SELECT calls_used,max_calls,status FROM service_grants WHERE grant_id=?1 AND direction='issued' AND expires_at>?2",
             params![grant.claims.grant_id.to_string(), Utc::now().to_rfc3339()],
@@ -914,15 +931,20 @@ impl Store {
         if status != "active" || calls >= max_calls {
             bail!("service grant is inactive or exhausted");
         }
+        let definition = self
+            .service(&grant.claims.service)?
+            .context("service is no longer registered")?;
+        authorize_with_cedar(
+            &definition.cedar_policy,
+            remote_endpoint,
+            &grant.claims.service,
+            operation,
+        )?;
         self.conn.execute(
             "UPDATE service_grants SET calls_used=calls_used+1 WHERE grant_id=?1",
             [grant.claims.grant_id.to_string()],
         )?;
-        Ok((
-            self.service(&grant.claims.service)?
-                .context("service is no longer registered")?,
-            grant.claims.project,
-        ))
+        Ok((definition, grant.claims.project))
     }
 
     fn service(&self, name: &str) -> Result<Option<ServiceDefinition>> {
